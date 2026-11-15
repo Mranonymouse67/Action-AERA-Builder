@@ -21,6 +21,12 @@ on:
         default: true
         type: boolean
 
+      nuke_volume_keys:
+        description: "Disable the hardware volume keys (no overlay, no audio volume file updates)"
+        required: false
+        default: true
+        type: boolean
+
 jobs:
   build:
     if: github.event.repository.owner.id == github.event.sender.id
@@ -216,6 +222,47 @@ jobs:
         PY
         grep -rn -B2 -A8 "AERA_VERBOSE_BROWSER_ENV_PATCH" "${{ env.SRC_DIR }}/bootable/recovery" --include=*.cpp --include=*.cc --include=*.c
 
+    - name: AERA - disable volume keys (no audio on this device)
+      if: ${{ inputs.nuke_volume_keys }}
+      run: |
+        # runner.cpp AdjustVolume() is what the volume keys call: it writes
+        # /tmp/aera-audio-volume and shows the volume overlay. Replace its body
+        # with a no-op. The Power+Volume Down screenshot chord and the startup
+        # Volume Down check are handled elsewhere and keep working.
+        python3 - <<'PY'
+        import re, sys
+        from pathlib import Path
+
+        f = Path("${{ env.SRC_DIR }}/bootable/recovery/aeraui/core/runner.cpp")
+        s = f.read_text()
+        MARK = "AERA_NO_VOLUME_KEYS_PATCH"
+        if MARK in s:
+            sys.exit(0)
+
+        def fail(msg):
+            print("lines mentioning volume in", f)
+            for i, l in enumerate(s.split("\n"), 1):
+                if "AdjustVolume" in l or "WriteVolume" in l or "ShowVolume" in l:
+                    print(f"  {i}: {l}")
+            sys.exit("::error::" + msg)
+
+        pat = re.compile(
+            r'void AdjustVolume\([^)]*\)\s*\{.*?\n\}\n', re.S)
+        if len(pat.findall(s)) != 1:
+            fail("AdjustVolume() not found exactly once, update the patch")
+
+        stub = ("// " + MARK + ": audio unsupported, volume keys are ignored.\n"
+                "void AdjustVolume(Engine&, InteractionBoost&, HardwareState&, int) {}\n")
+        s = pat.sub(lambda m: stub, s, count=1)
+
+        # WriteVolume must stay referenced or -Werror=unused-function trips.
+        if s.count("WriteVolume(") < 2:
+            fail("WriteVolume() is no longer called anywhere; keep one call")
+        f.write_text(s)
+        print("patched", f)
+        PY
+        grep -n -B1 -A2 "AERA_NO_VOLUME_KEYS_PATCH" "${{ env.SRC_DIR }}/bootable/recovery/aeraui/core/runner.cpp"
+
     - name: Get bootable/recovery commit
       id: recovery_commit
       run: |
@@ -327,5 +374,6 @@ jobs:
           Device tree commit: [${{ steps.devtree_commit.outputs.commit }}](${{ env.DEVICE_TREE_WEB }}/tree/${{ steps.devtree_commit.outputs.commit }})
           bootable/recovery commit: [${{ steps.recovery_commit.outputs.commit }}](https://github.com/AERA-Recovery/android_bootable_recovery/tree/${{ steps.recovery_commit.outputs.commit }})
           Verbose browser logging: ${{ inputs.verbose_browser }}
+          Volume keys disabled: ${{ inputs.nuke_volume_keys }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
