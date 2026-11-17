@@ -751,6 +751,8 @@ jobs:
         def find(name, needle):
             hits = [p for p in root.rglob(name)
                     if ".git" not in p.parts and needle in p.read_text(errors="ignore")]
+            if len(hits) > 1:  # several features ship same-named files; keep the browser one
+                hits = [p for p in hits if "browser" in p.parts]
             if len(hits) != 1:
                 sys.exit(f"::error::expected exactly one {name} containing {needle!r}, got {hits}")
             return hits[0]
