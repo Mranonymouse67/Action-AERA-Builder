@@ -27,6 +27,12 @@ on:
         default: true
         type: boolean
 
+      install_probe:
+        description: "Install the browser/UI probe (writes /sdcard/browserlogs: browser errors + UI fps)"
+        required: false
+        default: true
+        type: boolean
+
 jobs:
   build:
     if: github.event.repository.owner.id == github.event.sender.id
@@ -286,6 +292,415 @@ jobs:
         echo "commit=$COMMIT" >> $GITHUB_OUTPUT
         echo "device tree: $COMMIT"
 
+    # Shell "patch": drops the probe script into the device tree's recovery
+    # ramdisk overlay and starts it from init. Idempotent (skips the rc edit if
+    # the service is already there). Output: /sdcard/browserlogs
+    - name: AERA - install browser/UI probe (writes /sdcard/browserlogs)
+      if: ${{ inputs.install_probe }}
+      run: |
+        set -e
+        D="${{ env.SRC_DIR }}/${{ env.DEVICE_PATH }}"
+        BIN="$D/recovery/root/system/bin"
+        RC="$D/recovery/root/init.recovery.services.rc"
+        [ -d "$D/recovery/root" ] || { echo "::error::$D/recovery/root not found"; exit 1; }
+        [ -f "$RC" ] || { echo "::error::$RC not found"; exit 1; }
+        mkdir -p "$BIN"
+        cat > "$BIN/aera_browser_probe.sh" <<'PROBE_EOF'
+        #!/system/bin/sh
+        # aera_browser_probe.sh  -  AERA recovery probe for the "sky" (Adreno 613) browser
+        #
+        # Does two jobs while the recovery runs:
+        #   1. Lists every browser / EGL / Zink / Turnip / Vulkan error that shows up in
+        #      recovery.log, with a stage-by-stage diagnosis.
+        #   2. Samples the UI frame rate by counting DRM page-flip and vblank events
+        #      from the kernel tracing interface (once per second).
+        #
+        # Output goes to /sdcard/browserlogs. Until /sdcard is writable (it is not before
+        # the data partition is decrypted) everything is spooled in /tmp/browserlogs and
+        # copied over as soon as the sdcard becomes usable.
+        #
+        #   browser_errors.log   every matching recovery.log line, timestamped
+        #   browser_summary.txt  diagnosis, rewritten whenever new lines arrive
+        #   fps_samples.csv      uptime_s,interval_ms,flips,vblanks,flip_fps_x10,vblank_hz_x10
+        #   fps_summary.txt      UI fps over active seconds, rewritten every 10 s
+        #   system_info.txt      one-time snapshot (renderer, GPU nodes, panel mode, tracing)
+        #
+        # Stop it:  touch /sdcard/browserlogs/STOP      (or: setprop ctl.stop aera-browser-probe)
+        # UI fps is only meaningful while the UI is changing: scroll or swipe while it runs.
+
+        PATH=/system/bin:/vendor/bin:/sbin:$PATH
+        export PATH
+
+        TMPOUT=${AERA_PROBE_TMP:-/tmp/browserlogs}
+        SDROOTS=${AERA_PROBE_SDROOTS:-"/sdcard /data/media/0"}
+        RLOGS=${AERA_PROBE_RLOG:-"/tmp/recovery.log /cache/recovery/log"}
+        TRACEDIRS=${AERA_PROBE_TRACE:-"/sys/kernel/tracing /sys/kernel/debug/tracing"}
+        PLUGIN_DIR=${AERA_PROBE_PLUGIN:-/sdcard/AERA/plugins/browser}
+
+        ERR="$TMPOUT/browser_errors.log"
+        SUM="$TMPOUT/browser_summary.txt"
+        CSV="$TMPOUT/fps_samples.csv"
+        FPSSUM="$TMPOUT/fps_summary.txt"
+        INFO="$TMPOUT/system_info.txt"
+
+        # Lines worth keeping from recovery.log
+        BROWSER_RE='MESA-EGL|MESA:|ZINK|TU:|libEGL|libGL:|Could not create surfaceless|EGL_NOT_INITIALIZED|dri2|Browser display|Invalid software browser|aera-browser|AERA-DEBUG|Vulkan Loader.*(ERROR|WARNING|freedreno|kgsl|[Ff]ailed)|Aborting|Unknown GPU|unsupported|not supported|Process ended with error'
+
+        up() { read -r _u _ < /proc/uptime; echo "${_u%.*}"; }
+        up_cs() {
+            read -r _u _ < /proc/uptime
+            _s=${_u%.*}
+            _f=${_u#*.}
+            _f=${_f#0}
+            [ -n "$_f" ] || _f=0
+            echo $((_s * 100 + _f))
+        }
+        stamp() { echo "[$(up)s $(date '+%H:%M:%S')]"; }
+
+        SD=""          # chosen sdcard root, empty until usable
+        SD_DONE_INFO=0
+
+        find_sd() {
+            SD=""
+            for r in $SDROOTS; do
+                if [ -d "$r/Android" ] || [ -d "$r/Download" ] || [ -d "$r/AERA" ]; then
+                    SD=$r
+                    return 0
+                fi
+            done
+            return 1
+        }
+
+        mirror() {
+            find_sd || return 1
+            dest="$SD/browserlogs"
+            mkdir -p "$dest" 2>/dev/null || return 1
+            [ -w "$dest" ] || return 1
+            cp -f "$TMPOUT"/* "$dest"/ 2>/dev/null
+            # media_rw ownership so Android file managers can read the files later
+            chown 1023:1023 "$dest" "$dest"/* 2>/dev/null
+            chmod 0775 "$dest" 2>/dev/null
+            chmod 0664 "$dest"/* 2>/dev/null
+            return 0
+        }
+
+        stop_requested() {
+            [ -e "$TMPOUT/STOP" ] && return 0
+            if [ -n "$SD" ] && [ -e "$SD/browserlogs/STOP" ]; then return 0; fi
+            return 1
+        }
+
+        pick_rlog() {
+            RLOG=""
+            for c in $RLOGS; do
+                if [ -r "$c" ]; then RLOG=$c; return 0; fi
+            done
+            return 1
+        }
+
+        write_sysinfo() {
+            {
+                echo "== AERA browser probe : system info =="
+                echo "date            : $(date '+%F %T')   uptime: $(up)s"
+                echo "kernel          : $(uname -a 2>/dev/null)"
+                echo "device/platform : $(getprop ro.product.device) / $(getprop ro.board.platform)"
+                echo "ro.hardware.egl : $(getprop ro.hardware.egl)"
+                echo "gfx allocator   : init.svc.aera-graphics-allocator=$(getprop init.svc.aera-graphics-allocator)"
+                echo
+                echo "-- GPU nodes --"
+                ls -l /dev/kgsl-3d0 /dev/dri 2>&1
+                echo
+                echo "-- vendor GPU userspace (UI renderer needs these) --"
+                ls /vendor/lib64/egl 2>&1
+                ls -l /vendor/lib64/libgsl.so 2>&1
+                echo
+                echo "-- browser plugin on sdcard --"
+                ls -l "$PLUGIN_DIR" 2>&1
+                grep -E '"version"|"payload_sha256"|"payload_size"' "$PLUGIN_DIR/plugin.json" 2>&1
+                echo
+                echo "-- UI renderer evidence in recovery.log --"
+                if pick_rlog; then
+                    grep -E 'display mode|DRM refresh|Using drm graphics|zero-copy|GPU ready|Adreno|renderer|GGL_PIXEL' "$RLOG" | head -20
+                    if grep -q -E 'zero-copy|GPU ready' "$RLOG"; then
+                        echo "verdict: UI looks GPU rendered (vendor EGL)"
+                    elif grep -q 'Using drm graphics' "$RLOG"; then
+                        echo "verdict: UI uses plain DRM drawing (CPU/software) - no GPU-ready message found"
+                    else
+                        echo "verdict: unknown"
+                    fi
+                else
+                    echo "recovery.log not found in: $RLOGS"
+                fi
+                echo
+                echo "-- tracing --"
+                echo "trace dir: ${T:-none}   fps mode: ${FPS_MODE:-none}"
+                for d in drm sde msm_drm; do
+                    [ -n "$T" ] && [ -d "$T/events/$d" ] && echo "events/$d: $(ls "$T/events/$d" | tr '\n' ' ')"
+                done
+                echo
+                echo "-- kernel GPU messages --"
+                dmesg 2>/dev/null | grep -i -E 'kgsl|a6xx|adreno|gmu|zap' | tail -30
+            } > "$INFO" 2>&1
+        }
+
+        # ---------------------------------------------------------------- browser errors
+        last_line=0
+        summarize() {
+            has() { grep -q -E "$1" "$ERR"; }
+            {
+                echo "AERA browser probe summary   $(date '+%F %T')   uptime $(up)s"
+                echo "browser aborts seen        : $(grep -c 'Could not create surfaceless' "$ERR")"
+                echo "Turnip instances created   : $(grep -c 'Created an instance' "$ERR")"
+                echo
+                echo "Diagnosis:"
+                if has 'AERA-DEBUG-CTOR'; then
+                    echo " - debug Turnip build is loaded (AERA-DEBUG-CTOR line present)"
+                else
+                    echo " - no AERA-DEBUG-CTOR line: the debug Turnip build is NOT the one running (or it is not loaded)"
+                fi
+                if has 'Found compatible device'; then
+                    echo " - Turnip found /dev/kgsl-3d0 and enumerated the GPU"
+                elif has 'TU:.*(Unknown GPU|unsupported|not supported|Unrecognized)'; then
+                    echo " - Turnip REJECTED the GPU (unknown or unsupported chip id) - see TU: lines below"
+                elif has 'TU:'; then
+                    echo " - Turnip started but never reported a compatible device"
+                else
+                    echo " - no TU: lines at all: Turnip never started (Vulkan loader / ICD problem)"
+                fi
+                if has 'ZINK'; then
+                    echo " - Zink printed its own error(s) - see ZINK lines below"
+                fi
+                if has 'failed to create dri2 screen'; then
+                    if has 'Found compatible device' && ! has 'ZINK'; then
+                        echo " - Vulkan device is fine but EGL could not create the Zink screen, and Zink printed nothing"
+                    else
+                        echo " - EGL could not create a DRI screen"
+                    fi
+                fi
+                if has 'surfaceless swrast'; then
+                    echo " - the software (swrast) fallback was tried; if it also fails the runtime has no software driver"
+                fi
+                if has 'Could not create surfaceless EGL display'; then
+                    echo " - the browser worker aborted: EGL_NOT_INITIALIZED"
+                fi
+                echo
+                echo "Last 25 matching lines:"
+                tail -n 25 "$ERR"
+            } > "$SUM"
+        }
+
+        scan_browser_log() {
+            pick_rlog || return 0
+            total=$(wc -l < "$RLOG")
+            total=$((total + 0))
+            [ "$total" -lt "$last_line" ] && last_line=0
+            [ "$total" -gt "$last_line" ] || return 0
+            tail -n +$((last_line + 1)) "$RLOG" | head -n $((total - last_line)) | grep -E "$BROWSER_RE" > "$TMPOUT/.hit"
+            last_line=$total
+            if [ -s "$TMPOUT/.hit" ]; then
+                s=$(stamp)
+                while IFS= read -r line; do
+                    echo "$s $line"
+                done < "$TMPOUT/.hit" >> "$ERR"
+                # keep the file bounded
+                n=$(wc -l < "$ERR")
+                [ "$n" -gt 6000 ] && { tail -n 4000 "$ERR" > "$TMPOUT/.e"; cat "$TMPOUT/.e" > "$ERR"; }
+                summarize
+                {
+                    echo "== kernel messages after browser activity ($(stamp)) =="
+                    dmesg 2>/dev/null | grep -i -E 'kgsl|dma_heap|aera-browser|avc: +denied.*(kgsl|aera)' | tail -15
+                } > "$TMPOUT/browser_kernel.log" 2>&1
+                mirror
+            fi
+        }
+
+        # ---------------------------------------------------------------------- UI fps
+        T=""
+        FPS_MODE=none
+        FPS_REASON=""
+        last_cs=0
+        all_tot=0; all_act=0; all_sum=0; all_max=0; all_vb=0; all_fl=0
+
+        setup_trace() {
+            T=""
+            for c in $TRACEDIRS; do
+                [ -d "$c/events" ] && { T=$c; break; }
+            done
+            if [ -z "$T" ]; then
+                mount -t tracefs nodev /sys/kernel/tracing 2>/dev/null
+                [ -d /sys/kernel/tracing/events ] && T=/sys/kernel/tracing
+            fi
+            if [ -z "$T" ]; then
+                mount -t debugfs nodev /sys/kernel/debug 2>/dev/null
+                [ -d /sys/kernel/debug/tracing/events ] && T=/sys/kernel/debug/tracing
+            fi
+            if [ -z "$T" ]; then
+                FPS_REASON="no tracefs/debugfs tracing interface in this kernel"
+                return 1
+            fi
+            echo 0 > "$T/tracing_on" 2>/dev/null
+            : > "$T/trace" 2>/dev/null
+            echo 2048 > "$T/buffer_size_kb" 2>/dev/null
+            ok=0
+            for ev in drm_vblank_event drm_vblank_event_delivered; do
+                if [ -w "$T/events/drm/$ev/enable" ]; then
+                    echo 1 > "$T/events/drm/$ev/enable" && ok=1
+                fi
+            done
+            if [ "$ok" = 0 ]; then
+                FPS_REASON="tracing present but no drm:drm_vblank_event* tracepoints (see system_info.txt)"
+                return 1
+            fi
+            echo 1 > "$T/tracing_on" 2>/dev/null
+            FPS_MODE=trace
+            last_cs=$(up_cs)
+            echo "uptime_s,interval_ms,flips,vblanks,flip_fps_x10,vblank_hz_x10" > "$CSV"
+            return 0
+        }
+
+        fmt10() { echo "$(($1 / 10)).$(($1 % 10))"; }
+
+        sample_fps() {
+            [ "$FPS_MODE" = trace ] || return 0
+            now=$(up_cs)
+            cat "$T/trace" > "$TMPOUT/.tr" 2>/dev/null
+            : > "$T/trace" 2>/dev/null
+            fl=$(grep -c 'drm_vblank_event_delivered' "$TMPOUT/.tr")
+            vb=$(grep -c ' drm_vblank_event:' "$TMPOUT/.tr")
+            dt=$((now - last_cs))
+            [ "$dt" -gt 0 ] || dt=100
+            last_cs=$now
+            ffps=$((fl * 1000 * 100 / (dt * 100)))      # flips per second x10
+            ffps=$((fl * 10000 / (dt * 10)))
+            vhz=$((vb * 10000 / (dt * 10)))
+            echo "$(up),$((dt * 10)),$fl,$vb,$ffps,$vhz" >> "$CSV"
+            all_tot=$((all_tot + 1))
+            all_vb=$((all_vb + vb))
+            all_fl=$((all_fl + fl))
+            if [ "$fl" -ge 3 ]; then
+                all_act=$((all_act + 1))
+                all_sum=$((all_sum + ffps))
+                [ "$ffps" -gt "$all_max" ] && all_max=$ffps
+            fi
+            n=$(wc -l < "$CSV")
+            [ "$n" -gt 20000 ] && { { head -n 1 "$CSV"; tail -n 10000 "$CSV"; } > "$TMPOUT/.c"; cat "$TMPOUT/.c" > "$CSV"; }
+        }
+
+        write_fps_summary() {
+            {
+                echo "AERA UI fps summary   $(date '+%F %T')   uptime $(up)s"
+                if [ "$FPS_MODE" != trace ]; then
+                    echo "UI fps could NOT be measured: $FPS_REASON"
+                    [ -r /sys/class/graphics/fb0/measured_fps ] && echo "fb0 measured_fps: $(cat /sys/class/graphics/fb0/measured_fps)"
+                    return 0
+                fi
+                echo "method: DRM page-flip events (drm_vblank_event_delivered) per second"
+                echo "seconds sampled           : $all_tot"
+                echo "seconds with UI activity  : $all_act   (>= 3 flips in that second)"
+                if [ "$all_act" -gt 0 ]; then
+                    echo "average UI fps (active)   : $(fmt10 $((all_sum / all_act)))"
+                    echo "peak UI fps               : $(fmt10 "$all_max")"
+                else
+                    echo "average UI fps (active)   : n/a - no active seconds yet. Scroll or swipe the UI."
+                fi
+                if [ "$all_tot" -gt 0 ]; then
+                    echo "vblank events per second  : $(fmt10 $((all_vb * 10 / all_tot))) average (only counted around display commits, NOT the panel refresh rate)"
+                fi
+                if [ "$all_act" = 0 ] && [ "$all_vb" = 0 ] && [ "$all_fl" = 0 ]; then
+                    echo "NOTE: zero display events so far. An idle UI does not commit frames, so this is"
+                    echo "      expected until you scroll, swipe or open a menu while the probe runs."
+                fi
+                if [ "$all_fl" = 0 ] && [ "$all_vb" -gt 0 ]; then
+                    echo "NOTE: vblanks are counted but no page-flip events: the UI may not request flip"
+                    echo "      events, so fps cannot be measured this way. See system_info.txt for other"
+                    echo "      tracepoints."
+                fi
+                echo
+                echo "last 60 s window:"
+                stats=$(tail -n 60 "$CSV" | {
+                    tot=0; act=0; sum=0; mx=0
+                    while IFS=, read -r u d f v p h; do
+                        case "$u" in uptime_s) continue;; esac
+                        tot=$((tot + 1))
+                        if [ "$f" -ge 3 ]; then
+                            act=$((act + 1)); sum=$((sum + p))
+                            [ "$p" -gt "$mx" ] && mx=$p
+                        fi
+                    done
+                    echo "$tot $act $sum $mx"
+                })
+                set -- $stats
+                if [ "${2:-0}" -gt 0 ]; then
+                    echo "  active seconds $2 of $1, average $(fmt10 $(($3 / $2))) fps, peak $(fmt10 "$4") fps"
+                else
+                    echo "  no UI activity in the last $1 s"
+                fi
+            } > "$FPSSUM" 2>&1
+        }
+
+        cleanup() {
+            if [ -n "$T" ]; then
+                for ev in drm_vblank_event drm_vblank_event_delivered; do
+                    echo 0 > "$T/events/drm/$ev/enable" 2>/dev/null
+                done
+            fi
+            write_fps_summary
+            summarize
+            mirror
+            exit 0
+        }
+
+        # ------------------------------------------------------------------------ main
+        mkdir -p "$TMPOUT"
+        rm -f "$TMPOUT/STOP"
+        : > "$ERR"
+        trap cleanup TERM INT HUP
+
+        setup_trace
+        write_sysinfo
+        write_fps_summary
+        summarize
+
+        loop=0
+        while :; do
+            sample_fps
+            [ $((loop % 2)) -eq 0 ] && scan_browser_log
+            if [ $((loop % 10)) -eq 0 ]; then
+                write_fps_summary
+                if mirror && [ "$SD_DONE_INFO" = 0 ]; then
+                    # first time the sdcard is usable: refresh the snapshot (plugin info needs /sdcard)
+                    write_sysinfo
+                    mirror
+                    SD_DONE_INFO=1
+                fi
+            fi
+            stop_requested && cleanup
+            loop=$((loop + 1))
+            sleep 1
+        done
+        PROBE_EOF
+        chmod 0755 "$BIN/aera_browser_probe.sh"
+        sh -n "$BIN/aera_browser_probe.sh"
+        if ! grep -q "aera-browser-probe" "$RC"; then
+          cat >> "$RC" <<'RC_EOF'
+
+        # >>> AERA browser/UI probe (writes /sdcard/browserlogs)
+        service aera-browser-probe /system/bin/sh /system/bin/aera_browser_probe.sh
+            class core
+            disabled
+            user root
+            group root
+            seclabel u:r:recovery:s0
+            stdio_to_kmsg
+
+        on boot
+            start aera-browser-probe
+        # AERA browser/UI probe <<<
+        RC_EOF
+        fi
+        ls -l "$BIN/aera_browser_probe.sh"
+        grep -n -A12 "AERA browser/UI probe (writes" "$RC"
+
     - name: Set swap space
       uses: pierotofy/set-swap-space@master
       with:
@@ -375,5 +790,6 @@ jobs:
           Device tree commit: [${{ steps.devtree_commit.outputs.commit }}](${{ env.DEVICE_TREE_WEB }}/tree/${{ steps.devtree_commit.outputs.commit }})
           bootable/recovery commit: [${{ steps.recovery_commit.outputs.commit }}](https://github.com/AERA-Recovery/android_bootable_recovery/tree/${{ steps.recovery_commit.outputs.commit }})
           Verbose browser logging: ${{ inputs.verbose_browser }}
+          Probe installed: ${{ inputs.install_probe }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
