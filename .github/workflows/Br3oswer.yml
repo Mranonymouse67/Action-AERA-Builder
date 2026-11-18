@@ -1,570 +1,81 @@
-name: Build AERA (recovery + browser plugin)
+name: Build AERA skysim2 + browser (maximum logging)
 
 # One workflow, two products:
-#   recovery  -> AERA recovery image/zip for Redmi "sky" (dispatch only)
-#   plugin    -> AERA Browser plugin (.aerap): Turnip + optional llvmpipe fallback
-# The llvmpipe fallback needs BOTH halves: the plugin ships /usr/lib/llvmpipe in
-# the runtime, the recovery jail/launcher select it and retry when the GPU
-# stack produces no frame. Every patch is embedded below; nothing else to add.
+#   recovery        -> AERA recovery for sky (patched, verbose browser env, probe, ...)
+#   browser_build   -> Turnip (Adreno 613) and an instrumented Mesa EGL/Zink/softpipe build
+#   browser_package -> overlay onto the published runtime, pack, unsigned .aerap
+# The browser jobs run AFTER recovery and are continue-on-error: they can never fail
+# the workflow, and they still run when recovery failed.
 
 on:
-  push:
-    tags: ["v*"]
-  pull_request:
   workflow_dispatch:
     inputs:
-      build_recovery:
-        description: "Build the AERA recovery image"
-        type: boolean
-        default: true
-      build_plugin:
-        description: "Build the AERA Browser plugin package"
-        type: boolean
-        default: true
-      llvmpipe_fallback:
-        description: "Add the llvmpipe software-GL fallback (plugin libs + recovery retry patch)"
-        type: boolean
-        default: true
       device_tree_url:
         description: "Device tree repository"
         required: true
         default: https://github.com/Adithy4n/recovery_device_xiaomi_sky.git
         type: string
+
       device_tree_branch:
         description: "Device tree branch"
         required: true
         default: Abort
         type: string
+
       verbose_browser:
         description: "Maximum-verbose browser GPU/EGL/Vulkan logging (adds debug env vars to the browser jail)"
-        type: boolean
+        required: false
         default: true
+        type: boolean
+
       nuke_volume_keys:
         description: "Disable the hardware volume keys (no overlay, no audio volume file updates)"
-        type: boolean
+        required: false
         default: true
+        type: boolean
+
+      install_probe:
+        description: "Install the browser/UI probe (writes /sdcard/browserlogs: browser errors + UI fps)"
+        required: false
+        default: true
+        type: boolean
+
+      build_browser:
+        description: "Also build the browser plugin (.aerap) after the recovery"
+        required: false
+        default: true
+        type: boolean
+
+      plugin_version:
+        description: "Plugin version (blank = 1.6.<run number>). Must differ from the repo's plugin.json."
+        required: false
+        type: string
+
       staged_runtime_url:
-        description: "URL of the staged ARM64 runtime tarball (overrides vars.STAGED_RUNTIME_URL)"
-        required: false
-        type: string
-      version:
-        description: "Plugin version, e.g. 1.5.7 (defaults to tag name). Must differ from plugin.json in the repo."
+        description: "Optional URL of a staged ARM64 runtime tarball (blank = published runtime)"
         required: false
         type: string
 
-permissions:
-  contents: read
+      instrument_mesa:
+        description: "Rebuild Mesa EGL/Zink with AERA-FAIL prints at every screen-creation failure exit"
+        required: false
+        default: true
+        type: boolean
 
-env:
-  MESA_VERSION: "26.2.2"
-  LLVM_VERSION: "20.1.8"
-  # Redmi "sky" (ravelin): qcom,chipid = <0x06010300>, Adreno613v1.
-  A613_CHIP_ID: "0x06010300"
-  # Expanded runtime cap raised from 256 MiB to 384 MiB to fit libLLVM.
-  AERA_MAX_EXPANDED_BYTES: "402653184"
+      add_softpipe:
+        description: "Add the softpipe CPU renderer so Mesa's software fallback has a driver"
+        required: false
+        default: true
+        type: boolean
 
 jobs:
-  # ===========================================================================
-  # PLUGIN
-  # ===========================================================================
-  validate:
-    if: github.event_name != 'workflow_dispatch' || inputs.build_plugin
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Locate project root
-        run: |
-          if [ ! -f source/pack.py ]; then
-            root=$(find . -maxdepth 3 -path ./.git -prune -o -type f -name pack.py -path '*/source/*' -print | head -n1)
-            if [ -n "$root" ]; then
-              root=$(dirname "$(dirname "$root")")
-            else
-              echo "source/pack.py not found in checkout; cloning AERA-Plugins/browser"
-              git clone --depth 1 https://github.com/AERA-Plugins/browser.git /tmp/browser-src
-              root=/tmp/browser-src
-            fi
-            echo "Using project root: $root"
-            tar -C "$root" --exclude=.git --exclude=.github -cf - . | tar -xf -
-          fi
-          ls source
-
-      - name: Shell + Python syntax
-        run: |
-          for f in source/*.sh; do bash -n "$f"; done
-          python3 -m py_compile source/pack.py
-
-      - name: plugin.json is valid JSON
-        run: python3 -m json.tool plugin.json > /dev/null
-
-      - name: Mesa patches apply to a fresh ${{ env.MESA_VERSION }} tree
-        run: |
-          curl -fsSL "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" | tar -xJ
-          cd "mesa-${MESA_VERSION}"
-          dev=src/freedreno/common/freedreno_devices.py
-          grep -n -E '613|0x0601[0-9a-f]{4}' "$dev" || true
-          python3 - "$dev" <<'PY'
-          import os, re, sys
-          p = sys.argv[1]
-          s = open(p).read()
-          if "Adreno (TM) 613" in s:
-              print("Adreno (TM) 613 already present; not inserting")
-              sys.exit(0)
-          m = re.search(r'^([ \t]*)GPUId\(612\),\n', s, re.M)
-          if not m:
-              print("::error::GPUId(612) anchor not found")
-              sys.exit(1)
-          ind = m.group(1)
-          cid = os.environ["A613_CHIP_ID"]
-          name = '"Adreno (TM) 613"'
-          ids = [
-              f'GPUId(613, name={name})',
-              f'GPUId(chip_id={cid}, name={name})',
-              f'GPUId(chip_id=0xffff{cid[2:]}, name={name})',
-          ]
-          add = "".join(f"{ind}{i},\n" for i in ids)
-          s = s[:m.end()] + add + s[m.end():]
-          open(p, "w").write(s)
-          print("inserted Adreno 613 entries")
-          PY
-          grep -n -B3 -A6 'Adreno (TM) 613' "$dev"
-          for p in a825 a722 zink-kgsl-surfaceless; do
-            patch --dry-run -p1 -i "../source/patches/mesa-${MESA_VERSION}-$p"*.patch
-            patch -p1 -i "../source/patches/mesa-${MESA_VERSION}-$p"*.patch
-          done
-
-  turnip:
-    needs: validate
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Locate project root
-        run: |
-          if [ ! -f source/pack.py ]; then
-            root=$(find . -maxdepth 3 -path ./.git -prune -o -type f -name pack.py -path '*/source/*' -print | head -n1)
-            if [ -n "$root" ]; then
-              root=$(dirname "$(dirname "$root")")
-            else
-              git clone --depth 1 https://github.com/AERA-Plugins/browser.git /tmp/browser-src
-              root=/tmp/browser-src
-            fi
-            tar -C "$root" --exclude=.git --exclude=.github -cf - . | tar -xf -
-          fi
-          ls source
-
-      - name: Download Mesa ${{ env.MESA_VERSION }} and add Adreno 613
-        run: |
-          curl -fsSL "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" | tar -xJ
-          mv "mesa-${MESA_VERSION}" mesa-src
-          cd mesa-src
-          dev=src/freedreno/common/freedreno_devices.py
-          python3 - "$dev" <<'PY'
-          import os, re, sys
-          p = sys.argv[1]
-          s = open(p).read()
-          if "Adreno (TM) 613" in s:
-              sys.exit(0)
-          m = re.search(r'^([ \t]*)GPUId\(612\),\n', s, re.M)
-          if not m:
-              print("::error::GPUId(612) anchor not found")
-              sys.exit(1)
-          ind = m.group(1)
-          cid = os.environ["A613_CHIP_ID"]
-          name = '"Adreno (TM) 613"'
-          ids = [
-              f'GPUId(613, name={name})',
-              f'GPUId(chip_id={cid}, name={name})',
-              f'GPUId(chip_id=0xffff{cid[2:]}, name={name})',
-          ]
-          add = "".join(f"{ind}{i},\n" for i in ids)
-          s = s[:m.end()] + add + s[m.end():]
-          open(p, "w").write(s)
-          print("inserted Adreno 613 entries")
-          PY
-          grep -n -B3 -A6 'Adreno (TM) 613' "$dev"
-
-      - name: Add debug environment constructor to Turnip
-        run: |
-          f=mesa-src/src/freedreno/vulkan/tu_util.cc
-          [ -f "$f" ] || f=mesa-src/src/freedreno/vulkan/tu_device.cc
-          [ -f "$f" ] || { echo "::error::no Turnip source file found for the debug constructor"; exit 1; }
-          cat >> "$f" <<'EOF4'
-
-          /* AERA debug: surface Zink/Mesa error messages in recovery.log */
-          #include <stdlib.h>
-          #include <stdio.h>
-          __attribute__((constructor, used)) static void aera_debug_env_ctor(void)
-          {
-             setenv("AERA_DEBUG_ENV_CTOR", "1", 0);
-             setenv("MESA_LOG_LEVEL", "debug", 0);
-             fputs("AERA-DEBUG-CTOR: Turnip loaded, MESA_LOG_LEVEL set\n", stderr);
-             fflush(stderr);
-          }
-          EOF4
-          tail -12 "$f"
-
-      - name: Build libvulkan_freedreno.so (Alpine / musl)
-        run: |
-          cat > build-in-alpine.sh <<'SCRIPT'
-          set -eux
-          apk add --no-cache \
-            bash coreutils patch grep sed curl xz git \
-            build-base linux-headers meson samurai pkgconf \
-            python3 py3-mako py3-yaml py3-packaging py3-setuptools \
-            flex bison glslang vulkan-headers \
-            zlib-dev zstd-dev expat-dev libdrm-dev libxml2-dev
-
-          cat > /tmp/cross.ini <<'EOF2'
-          [binaries]
-          c = 'gcc'
-          cpp = 'g++'
-          ar = 'ar'
-          strip = 'strip'
-          pkg-config = 'pkg-config'
-
-          [host_machine]
-          system = 'linux'
-          cpu_family = 'aarch64'
-          cpu = 'aarch64'
-          endian = 'little'
-
-          [properties]
-          needs_exe_wrapper = false
-          EOF2
-
-          export NINJA=samu
-          export AERA_BROWSER_JOBS="$(nproc)"
-          bash source/build-turnip-a825.sh /work/mesa-src /work/mesa-build /tmp/cross.ini
-
-          mkdir -p /work/out
-          cp /work/mesa-build/src/freedreno/vulkan/libvulkan_freedreno.so /work/out/
-          strip --strip-unneeded /work/out/libvulkan_freedreno.so
-          ls -l /work/out
-          SCRIPT
-          docker run --rm -v "$PWD":/work -w /work alpine:3.22 sh build-in-alpine.sh
-
-      - name: Verify the built driver knows this GPU
-        run: |
-          sudo apt-get install -y binutils >/dev/null
-          lib=out/libvulkan_freedreno.so
-          strings "$lib" | grep -F 'Adreno (TM) 613' \
-            || { echo "::error::Adreno (TM) 613 not present in built driver"; exit 1; }
-          for n in 'Adreno (TM) 722' 'Adreno (TM) 825'; do
-            strings "$lib" | grep -qF "$n" || { echo "::error::$n missing from built driver"; exit 1; }
-          done
-          strings "$lib" | grep -qF 'AERA_DEBUG_ENV_CTOR' \
-            || { echo "::error::debug constructor missing from built driver"; exit 1; }
-          echo "OK: 613 / 722 / 825 + debug constructor present"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: turnip
-          path: out/libvulkan_freedreno.so
-          if-no-files-found: error
-
-  # Optional software-GL fallback stack: AArch64-only LLVM + Mesa llvmpipe
-  # (own EGL/gallium/LLVM libs), shipped separately in <runtime>/usr/lib/llvmpipe.
-  llvmpipe:
-    needs: validate
-    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || (inputs.build_plugin && inputs.llvmpipe_fallback))
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 240
-    steps:
-      - name: Download Mesa ${{ env.MESA_VERSION }}
-        run: |
-          curl -fsSL "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" | tar -xJ
-          mv "mesa-${MESA_VERSION}" mesa-src
-
-      - name: Cache AArch64-only LLVM
-        uses: actions/cache@v4
-        with:
-          path: llvm-prefix
-          key: llvm-aarch64-musl-${{ env.LLVM_VERSION }}-v1
-
-      - name: Build llvmpipe stack (Alpine / musl)
-        run: |
-          cat > build-llvmpipe.sh <<'SCRIPT'
-          set -eux
-          LLVM_PREFIX=/work/llvm-prefix
-          OUT=/work/out-llvmpipe
-          JOBS="$(nproc)"
-          apk add --no-cache bash coreutils curl xz git build-base linux-headers cmake \
-            meson samurai pkgconf python3 py3-mako py3-yaml py3-packaging py3-setuptools \
-            flex bison zlib-dev expat-dev libdrm-dev libxml2-dev
-          export NINJA=samu
-
-          if [ ! -x "$LLVM_PREFIX/bin/llvm-config" ]; then
-            curl -fsSL "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz" | tar -xJ -C /tmp
-            cmake -S "/tmp/llvm-project-${LLVM_VERSION}.src/llvm" -B /tmp/llvm-build -G Ninja \
-              -DCMAKE_MAKE_PROGRAM="$(command -v samu)" \
-              -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$LLVM_PREFIX" \
-              -DLLVM_TARGETS_TO_BUILD=AArch64 \
-              -DLLVM_BUILD_LLVM_DYLIB=ON -DLLVM_LINK_LLVM_DYLIB=ON -DLLVM_ENABLE_RTTI=ON \
-              -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
-              -DLLVM_INCLUDE_DOCS=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_ZLIB=OFF \
-              -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_ASSERTIONS=OFF
-            samu -C /tmp/llvm-build -j"$JOBS" install
-          fi
-
-          cat > /tmp/cross-llvmpipe.ini <<EOT
-          [binaries]
-          c = 'gcc'
-          cpp = 'g++'
-          ar = 'ar'
-          strip = 'strip'
-          pkg-config = 'pkg-config'
-          llvm-config = '$LLVM_PREFIX/bin/llvm-config'
-
-          [host_machine]
-          system = 'linux'
-          cpu_family = 'aarch64'
-          cpu = 'aarch64'
-          endian = 'little'
-
-          [properties]
-          needs_exe_wrapper = false
-          EOT
-
-          meson setup /tmp/mesa-llvmpipe-build /work/mesa-src --cross-file /tmp/cross-llvmpipe.ini \
-            --prefix=/usr -Dbuildtype=release \
-            -Dgallium-drivers=llvmpipe -Dvulkan-drivers= -Dllvm=enabled -Dshared-llvm=enabled \
-            -Dplatforms= -Degl=enabled -Dgles2=enabled -Dgles1=disabled \
-            -Dopengl=false -Dglx=disabled -Dgbm=disabled -Dvideo-codecs= -Dbuild-tests=false
-          samu -C /tmp/mesa-llvmpipe-build -j"$JOBS"
-          DESTDIR=/tmp/mesa-llvmpipe-dest samu -C /tmp/mesa-llvmpipe-build install
-
-          mkdir -p "$OUT"
-          D=/tmp/mesa-llvmpipe-dest/usr/lib
-          cp -a "$D"/libEGL.so* "$D"/libGLESv2.so* "$D"/libglapi.so* "$D"/libgallium*.so "$OUT"/
-          cp -a "$LLVM_PREFIX"/lib/libLLVM*.so* "$OUT"/
-          strip --strip-unneeded "$OUT"/*.so* 2>/dev/null || true
-          ls -l "$OUT"
-          SCRIPT
-          docker run --rm -e LLVM_VERSION -v "$PWD":/work -w /work alpine:3.22 sh build-llvmpipe.sh
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: llvmpipe
-          path: out-llvmpipe
-          if-no-files-found: error
-
-  package:
-    needs: [turnip, llvmpipe]
-    if: ${{ !cancelled() && needs.turnip.result == 'success' && (needs.llvmpipe.result == 'success' || needs.llvmpipe.result == 'skipped') && github.event_name != 'pull_request' }}
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    env:
-      STAGED_RUNTIME_URL: ${{ inputs.staged_runtime_url || vars.STAGED_RUNTIME_URL }}
-      STAGED_RUNTIME_TOKEN: ${{ secrets.STAGED_RUNTIME_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Locate project root
-        run: |
-          if [ ! -f source/pack.py ]; then
-            root=$(find . -maxdepth 3 -path ./.git -prune -o -type f -name pack.py -path '*/source/*' -print | head -n1)
-            if [ -n "$root" ]; then
-              root=$(dirname "$(dirname "$root")")
-            else
-              git clone --depth 1 https://github.com/AERA-Plugins/browser.git /tmp/browser-src
-              root=/tmp/browser-src
-            fi
-            tar -C "$root" --exclude=.git --exclude=.github -cf - . | tar -xf -
-          fi
-          ls source
-
-      - name: Resolve version (must be bumped)
-        run: |
-          ver="${{ inputs.version }}"
-          if [ -z "$ver" ] && [ "$GITHUB_REF_TYPE" = tag ] && [[ "$GITHUB_REF_NAME" == v* ]]; then
-            ver="${GITHUB_REF_NAME#v}"
-          fi
-          cur=$(python3 -c "import json;print(json.load(open('plugin.json'))['version'])")
-          if [ -z "$ver" ]; then
-            ver=$(python3 -c "import sys;a=sys.argv[1].split('.');a[-1]=str(int(a[-1])+1);print('.'.join(a))" "$cur")
-            echo "::warning::No tag or version input; auto-bumping $cur -> $ver"
-          fi
-          if [ "$ver" = "$cur" ]; then
-            echo "::error::Version $ver equals plugin.json ($cur). Bump it."
-            exit 1
-          fi
-          echo "PLUGIN_VERSION=$ver" >> "$GITHUB_ENV"
-          echo "Building version $ver (was $cur)"
-
-      - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y xz-utils zstd xxd binutils
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: turnip
-          path: turnip
-
-      - name: Fetch base runtime
-        run: |
-          mkdir stage
-          if [ -n "${STAGED_RUNTIME_URL:-}" ]; then
-            auth=()
-            [ -n "${STAGED_RUNTIME_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $STAGED_RUNTIME_TOKEN")
-            curl -fsSL "${auth[@]}" -o stage.tar "$STAGED_RUNTIME_URL"
-            tar --no-same-owner -xf stage.tar -C stage
-            if [ "$(ls -A stage | wc -l)" = 1 ] && [ -d "stage/$(ls stage)" ]; then
-              mv "stage/$(ls stage)" stage-root && rm -rf stage && mv stage-root stage
-            fi
-          else
-            url=$(python3 -c "import json;print(json.load(open('plugin.json'))['payload_url'])")
-            want=$(python3 -c "import json;print(json.load(open('plugin.json'))['payload_sha256'])")
-            echo "STAGED_RUNTIME_URL not set; using published runtime: $url"
-            curl -fsSL -o base-runtime.xz "$url"
-            echo "$want  base-runtime.xz" | sha256sum -c -
-            python3 - base-runtime.xz stage <<'PY'
-          import os, struct, subprocess, sys
-
-          src, dest = sys.argv[1], sys.argv[2]
-          raw = subprocess.run(["xz", "-dc", src], check=True, stdout=subprocess.PIPE).stdout
-          if raw[:8] != b"AERAWEB1":
-              sys.exit("not an AERA runtime payload")
-          count = struct.unpack_from("<I", raw, 8)[0]
-          pos = 12
-          root = os.path.realpath(dest)
-          for _ in range(count):
-              nlen, mode, size = struct.unpack_from("<HHQ", raw, pos)
-              pos += 12
-              name = raw[pos:pos + nlen].decode("utf-8")
-              pos += nlen
-              pos += -pos % 4
-              data = raw[pos:pos + size]
-              pos += size
-              if name.startswith("/") or any(p in ("", ".", "..") for p in name.split("/")):
-                  sys.exit(f"unsafe path in payload: {name}")
-              path = os.path.join(root, name)
-              os.makedirs(os.path.dirname(path), exist_ok=True)
-              if mode == 0:
-                  target = os.path.relpath(os.path.join(root, data.decode()), os.path.dirname(path))
-                  os.symlink(target, path)
-              else:
-                  with open(path, "wb") as f:
-                      f.write(data)
-                  os.chmod(path, mode)
-          if pos != len(raw):
-              sys.exit("trailing bytes in payload")
-          print(f"unpacked {count} members")
-          PY
-          fi
-
-      - name: Replace Turnip driver in staged runtime
-        run: |
-          mapfile -t hits < <(find stage -name libvulkan_freedreno.so -type f)
-          if [ "${#hits[@]}" -eq 0 ]; then
-            echo "::error::libvulkan_freedreno.so not found in staged runtime"; exit 1
-          fi
-          for h in "${hits[@]}"; do
-            echo "replacing $h"
-            install -m 0755 turnip/libvulkan_freedreno.so "$h"
-            strings "$h" | grep -qF 'Adreno (TM) 613' \
-              || { echo "::error::$h lacks Adreno 613 after replace"; exit 1; }
-          done
-
-      - name: Add llvmpipe fallback libs to staged runtime
-        if: ${{ needs.llvmpipe.result == 'success' }}
-        run: |
-          # Recovery's jail expects them in /usr/lib/llvmpipe (runtime root = /).
-          # Drop any stale copy first so a rebuild never mixes LLVM versions.
-          rm -rf stage/usr/lib/llvmpipe
-          mkdir -p stage/usr/lib/llvmpipe
-      - uses: actions/download-artifact@v4
-        if: ${{ needs.llvmpipe.result == 'success' }}
-        with:
-          name: llvmpipe
-          path: stage/usr/lib/llvmpipe
-      - name: Check llvmpipe layout and sizes
-        if: ${{ needs.llvmpipe.result == 'success' }}
-        run: |
-          ls -l stage/usr/lib/llvmpipe
-          ls stage/usr/lib/llvmpipe | grep -q '^libLLVM' || { echo "::error::libLLVM missing"; exit 1; }
-          ls stage/usr/lib/llvmpipe | grep -q '^libEGL' || { echo "::error::libEGL missing"; exit 1; }
-          du -sh stage
-
-      - name: Raise pack.py expanded-size cap (embedded patch)
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("source/pack.py")
-          s = p.read_text()
-          old = "256 * 1024 * 1024"
-          if old not in s:
-              raise SystemExit("::error::256 MiB cap not found in pack.py; update the patch")
-          new = 'int(__import__("os").environ.get("AERA_MAX_EXPANDED_BYTES", 256 * 1024 * 1024))'
-          p.write_text(s.replace(old, new))
-          print("patched caps:", s.count(old))
-          PY
-          python3 -m py_compile source/pack.py
-
-      - name: Pack runtime.xz
-        run: python3 source/pack.py stage build
-
-      - name: Update plugin.json
-        run: |
-          python3 - "$PLUGIN_VERSION" <<'PY'
-          import hashlib, json, os, re, sys
-          ver = sys.argv[1]
-          hpp = open("build/aera_browser_payload.hpp").read()
-          num = lambda k: int(re.search(rf"{k}\s*=\s*(\d+)", hpp).group(1))
-          txt = lambda k: re.search(rf'{k}\[\]\s*=\s*"([0-9a-f]+)"', hpp).group(1)
-          p = json.load(open("plugin.json"))
-          p["version"] = ver
-          p["payload_url"] = (f"https://github.com/{os.environ['GITHUB_REPOSITORY']}"
-                              f"/releases/download/v{ver}/runtime.xz")
-          p["payload_size"]    = num("kCompressedBytes")
-          p["payload_sha256"]  = txt("kCompressedHash")
-          p["expanded_size"]   = num("kExpandedBytes")
-          p["expanded_sha256"] = txt("kExpandedHash")
-          p["member_count"]    = num("kMemberCount")
-          assert hashlib.sha256(open("build/runtime.xz","rb").read()).hexdigest() == p["payload_sha256"]
-          json.dump(p, open("build/plugin.json","w"), indent=2, ensure_ascii=False)
-          open("build/plugin.json","a").write("\n")
-          PY
-          head -20 build/plugin.json
-
-      - name: Build unofficial .aerap package
-        run: |
-          git clone --depth 1 https://github.com/AERA-Plugins/registry.git /tmp/registry
-          python3 /tmp/registry/scripts/package_aerap.py \
-            --manifest build/plugin.json \
-            --payload build/runtime.xz \
-            --output "build/AERA-Browser-${PLUGIN_VERSION}.aerap"
-          ls -l build/*.aerap
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: aera-browser-plugin
-          path: |
-            build/AERA-Browser-*.aerap
-            build/runtime.xz
-            build/plugin.json
-            build/manifest.json
-            build/aera_browser_payload.hpp
-          if-no-files-found: error
-
-      - name: Publish GitHub release
-        if: ${{ github.ref_type == 'tag' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          files=(build/runtime.xz build/plugin.json "build/AERA-Browser-${PLUGIN_VERSION}.aerap")
-          gh release create "$GITHUB_REF_NAME" "${files[@]}" \
-            --title "AERA Browser ${GITHUB_REF_NAME#v}" --generate-notes
-
-  # ===========================================================================
-  # RECOVERY
-  # ===========================================================================
   recovery:
-    if: github.event_name == 'workflow_dispatch' && inputs.build_recovery && github.event.repository.owner.id == github.event.sender.id
+    if: github.event.repository.owner.id == github.event.sender.id
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
       contents: write
+
     env:
       SYNC_URL: https://github.com/AERA-Recovery/android_manifest.git
       MANIFEST_BRANCH: "aera-16.0"
@@ -577,6 +88,7 @@ jobs:
       MAKEFILE_NAME: twrp_sky-bp2a-eng
       BUILD_TARGET: recovery
       TZ: Asia/Kolkata
+
     steps:
     - name: Cleanup
       uses: rokibhasansagar/slimhub_actions@main
@@ -604,9 +116,16 @@ jobs:
         cd "$GITHUB_WORKSPACE/${{ env.SRC_DIR }}"
         repo init --depth=1 -u ${{ env.SYNC_URL }} -b ${{ env.MANIFEST_BRANCH }}
         repo sync -c --force-sync --no-clone-bundle --no-tags -j$(nproc)
-
+                    
     - name: AERA - blank screen on boot only for non-NVT panels
       run: |
+        # TW_SCREEN_BLANK_ON_BOOT (aeraui/platform/aera_ui_host.cpp, gui_init)
+        # blanks and wakes the panel at recovery start. FTS panels (m19_42_*)
+        # need that, but on NVT panels (m19_36_*) it collides with the
+        # touch-FW load and breaks the display. Keep the flag true in
+        # BoardConfig; skip the cycle at runtime when an NVT panel is found:
+        #   1) /proc/cmdline msm_drm.dsi_display0=...m19_36 / m19_42...
+        #   2) fallback: /proc/NVTSPI or /proc/nvt_fw_version exists
         python3 - <<'PY'
         import re, sys
         from pathlib import Path
@@ -639,16 +158,19 @@ jobs:
 
         '''
 
+        # 1) unistd.h for access()
         inc = "#include <iterator>\n"
         if s.count(inc) != 1:
             fail("#include <iterator> anchor not found exactly once")
         s = s.replace(inc, inc + "#include <unistd.h>\n", 1)
 
+        # 2) helper right before gui_init
         anchor = 'extern "C" int gui_init() {'
         if s.count(anchor) != 1:
             fail("gui_init anchor not found exactly once")
         s = s.replace(anchor, helper + anchor, 1)
 
+        # 3) wrap the blank/wake cycle
         pat = re.compile(
             r'(#ifdef TW_SCREEN_BLANK_ON_BOOT[ \t]*\n)'
             r'([ \t]*aeraScreenTimer\.Blank\(\);[ \t]*\n)'
@@ -670,7 +192,12 @@ jobs:
         PY
         grep -n -B2 -A10 "aera_panel_is_nvt()" "${{ env.SRC_DIR }}/bootable/recovery/aeraui/platform/aera_ui_host.cpp"
 
-    # Must run BEFORE the llvmpipe patch: it anchors on the zink override line.
+    # Adds maximum-verbosity GPU-stack diagnostics to the browser jail's
+    # environment block. The launcher (jail_main.cpp, somewhere under
+    # bootable/recovery, probably aeraui/features/browser/) builds a fixed
+    # browser_environment[] and has no debug variables, so a failing
+    # "dri2 screen" never says why. The file is located by content, not by a
+    # hard-coded path, because the source tree has moved before.
     - name: AERA - verbose browser GPU/EGL/Vulkan logging
       if: ${{ inputs.verbose_browser }}
       run: |
@@ -687,6 +214,7 @@ jobs:
 
         def fail(msg):
             print("::error::" + msg)
+            print("Files mentioning the browser jail / zink env under", root)
             for p in sorted(root.rglob("*")):
                 if ".git" in p.parts or not p.is_file():
                     continue
@@ -709,13 +237,13 @@ jobs:
             fail("browser jail environment (" + NEEDLE + ") not found; update the patch")
 
         extra = [
-            ("EGL_LOG_LEVEL", "debug"),
-            ("LIBGL_DEBUG", "verbose"),
-            ("MESA_DEBUG", "1"),
-            ("MESA_LOG_LEVEL", "debug"),
-            ("TU_DEBUG", "startup"),
-            ("VK_LOADER_DEBUG", "all"),
-            ("G_MESSAGES_DEBUG", "all"),
+            ("EGL_LOG_LEVEL", "debug"),        # Mesa EGL: every probe + failure reason
+            ("LIBGL_DEBUG", "verbose"),        # Mesa loader: driver/DRI screen messages
+            ("MESA_DEBUG", "1"),               # Mesa core diagnostics
+            ("MESA_LOG_LEVEL", "debug"),       # Mesa log filter: shows Zink's own error messages
+            ("TU_DEBUG", "startup"),           # Turnip: device probe, unsupported-GPU reasons
+            ("VK_LOADER_DEBUG", "all"),        # Vulkan loader: ICD search, dlopen errors
+            ("G_MESSAGES_DEBUG", "all"),       # GLib/WPE: surfaceless display errors
         ]
 
         for f in hits:
@@ -734,131 +262,15 @@ jobs:
             f.write_text(s)
             print("patched", f)
         PY
-
-    # Embedded patch: jail --software-gl mode + launcher flag + 20 s no-frame
-    # watchdog in the browser scene. The retry only fires when the runtime has
-    # /usr/lib/llvmpipe (shipped by the plugin), so it is inert without it.
-    - name: AERA - llvmpipe software-GL fallback (jail, launcher, watchdog)
-      if: ${{ inputs.llvmpipe_fallback }}
-      run: |
-        python3 - <<'PY'
-        import sys
-        from pathlib import Path
-
-        root = Path("${{ env.SRC_DIR }}/bootable/recovery")
-        MARK = "AERA_LLVMPIPE_FALLBACK_PATCH"
-
-        def find(name, needle):
-            hits = [p for p in root.rglob(name)
-                    if ".git" not in p.parts and needle in p.read_text(errors="ignore")]
-            if len(hits) > 1:  # several features ship same-named files; keep the browser one
-                hits = [p for p in hits if "browser" in p.parts]
-            if len(hits) != 1:
-                sys.exit(f"::error::expected exactly one {name} containing {needle!r}, got {hits}")
-            return hits[0]
-
-        def edit(path, pairs):
-            s = path.read_text()
-            if MARK in s:
-                print("already patched:", path)
-                return
-            for old, new in pairs:
-                if s.count(old) != 1:
-                    sys.exit(f"::error::anchor not found exactly once in {path}:\n{old}")
-                s = s.replace(old, new, 1)
-            path.write_text("// " + MARK + "\n" + s)
-            print("patched", path)
-
-        # ---- launcher.hpp / launcher.cpp: Start(..., bool software_gl) ----
-        edit(find("launcher.hpp", "class BrowserProcess"), [
-            ("std::string &error);\n  bool Running();",
-             "std::string &error, bool software_gl = false);\n  bool Running();"),
-        ])
-        edit(find("launcher.cpp", "aera-browser-jail"), [
-            ("int &control_fd, std::string &error) {",
-             "int &control_fd, std::string &error,\n                           bool software_gl) {"),
-            ('''    execl("/system/bin/aera-browser-jail", "aera-browser-jail", "--browser",
-                  runtime.c_str(), nullptr);''',
-             '''    if (software_gl)
-              execl("/system/bin/aera-browser-jail", "aera-browser-jail", "--browser",
-                    runtime.c_str(), "--software-gl", nullptr);
-            else
-              execl("/system/bin/aera-browser-jail", "aera-browser-jail", "--browser",
-                    runtime.c_str(), nullptr);'''),
-        ])
-
-        # ---- jail_main.cpp: --software-gl switches the Mesa environment ----
-        edit(find("jail_main.cpp", "browser_environment"), [
-            ("  if ((!streams_engine_mode && argc != 3) ||",
-             '''  const bool software_gl_mode = argc == 4 && !strcmp(argv[1], "--browser") &&
-              !strcmp(argv[3], "--software-gl");
-          if ((!streams_engine_mode && !software_gl_mode && argc != 3) ||'''),
-            ("  const std::string root = argv[2];",
-             "  const bool software_gl = software_gl_mode;\n  const std::string root = argv[2];"),
-            ('''    const_cast<char *>("VK_DRIVER_FILES=/usr/share/vulkan/icd.d/freedreno_icd.json"),''',
-             '''    const_cast<char *>(software_gl ? "LD_LIBRARY_PATH=/usr/lib/llvmpipe:/usr/lib" :
-                "VK_DRIVER_FILES=/usr/share/vulkan/icd.d/freedreno_icd.json"),'''),
-            ('''    const_cast<char *>("MESA_LOADER_DRIVER_OVERRIDE=zink"),''',
-             '''    const_cast<char *>(software_gl ? "LIBGL_ALWAYS_SOFTWARE=1" :
-                "MESA_LOADER_DRIVER_OVERRIDE=zink"),
-            const_cast<char *>(software_gl ? "GALLIUM_DRIVER=llvmpipe" :
-                "MESA_SHADER_CACHE_DISABLE=true"),'''),
-            ('''    const_cast<char *>("ZINK_DESCRIPTORS=lazy"),''',
-             '''    const_cast<char *>(software_gl ? "LP_NUM_THREADS=6" : "ZINK_DESCRIPTORS=lazy"),'''),
-            ('''    const_cast<char *>("ZINK_DEBUG=sync,flushsync"),''',
-             '''    const_cast<char *>(software_gl ? "MESA_GLSL_CACHE_DISABLE=true" :
-                "ZINK_DEBUG=sync,flushsync"),'''),
-        ])
-
-        # ---- web_scene.cpp: one-shot retry when no frame arrives ----
-        scene = find("web_scene.cpp", "process.Start(")
-        edit(scene, [
-            ('#include "scene.hpp"',
-             '#include <chrono>\n#include <unistd.h>\n#include "scene.hpp"'),
-            ("  bool started = false, finished = false, auto_launch = true;",
-             '''  bool started = false, finished = false, auto_launch = true;
-          bool software_gl = false;
-          std::chrono::steady_clock::time_point launched_at{};'''),
-            ('''    if (!s->process.Running() && s->session.Connected())
-              s->session.Close();''',
-             '''    if (!s->software_gl && s->launched_at != std::chrono::steady_clock::time_point{} &&
-                !s->session.HasFrame()) {
-              const bool dead = !s->process.Running();
-              const bool slow = std::chrono::steady_clock::now() - s->launched_at >
-                  std::chrono::seconds(20);
-              if ((dead || slow) &&
-                  access((s->state.directory + "/usr/lib/llvmpipe").c_str(), F_OK) == 0) {
-                s->software_gl = true;
-                s->process.Stop();
-                s->session.Close();
-                int frame = -1, control = -1;
-                std::string error;
-                if (s->process.Start(s->state.directory, frame, control, error, true) &&
-                    s->session.Adopt(frame, control)) {
-                  s->launched_at = std::chrono::steady_clock::now();
-                  s->session.SetZoom(RecoveryBrowserZoom());
-                  const auto start_page = web::Address(RecoveryBrowserHomepage());
-                  if (!start_page.empty())
-                    s->session.Send(web::Kind::kOpen, 0, 0, 0, start_page.c_str());
-                } else {
-                  s->process.Stop();
-                }
-                return;
-              }
-            }
-            if (!s->process.Running() && s->session.Connected())
-              s->session.Close();'''),
-            ('''    const int zoom = RecoveryBrowserZoom();
-            s->session.SetZoom(zoom);''',
-             '''    s->launched_at = std::chrono::steady_clock::now();
-            const int zoom = RecoveryBrowserZoom();
-            s->session.SetZoom(zoom);'''),
-        ])
-        PY
+        grep -rn -B2 -A8 "AERA_VERBOSE_BROWSER_ENV_PATCH" "${{ env.SRC_DIR }}/bootable/recovery" --include=*.cpp --include=*.cc --include=*.c
 
     - name: AERA - disable volume keys (no audio on this device)
       if: ${{ inputs.nuke_volume_keys }}
       run: |
+        # runner.cpp AdjustVolume() is what the volume keys call: it writes
+        # /tmp/aera-audio-volume and shows the volume overlay. Replace its body
+        # with a no-op. The Power+Volume Down screenshot chord and the startup
+        # Volume Down check are handled elsewhere and keep working.
         python3 - <<'PY'
         import re, sys
         from pathlib import Path
@@ -876,7 +288,8 @@ jobs:
                     print(f"  {i}: {l}")
             sys.exit("::error::" + msg)
 
-        pat = re.compile(r'void AdjustVolume\([^)]*\)\s*\{.*?\n\}\n', re.S)
+        pat = re.compile(
+            r'void AdjustVolume\([^)]*\)\s*\{.*?\n\}\n', re.S)
         if len(pat.findall(s)) != 1:
             fail("AdjustVolume() not found exactly once, update the patch")
 
@@ -884,11 +297,30 @@ jobs:
                 "void AdjustVolume(Engine&, InteractionBoost&, HardwareState&, int) {}\n")
         s = pat.sub(lambda m: stub, s, count=1)
 
+        # WriteVolume must stay referenced or -Werror=unused-function trips.
         if s.count("WriteVolume(") < 2:
             fail("WriteVolume() is no longer called anywhere; keep one call")
         f.write_text(s)
         print("patched", f)
         PY
+        grep -n -B1 -A2 "AERA_NO_VOLUME_KEYS_PATCH" "${{ env.SRC_DIR }}/bootable/recovery/aeraui/core/runner.cpp"
+
+    - name: Record resolved sources, patches and runner environment
+      run: |
+        mkdir -p "$GITHUB_WORKSPACE/logs"
+        {
+          uname -a
+          nproc
+          free -h
+          df -h
+          env | sort | grep -v -i -E 'token|secret|password|key' || true
+        } > "$GITHUB_WORKSPACE/logs/runner-env.txt" 2>&1
+        cd "${{ env.SRC_DIR }}"
+        repo manifest -r -o "$GITHUB_WORKSPACE/logs/manifest-resolved.xml" || true
+        git -C bootable/recovery log -1 --format='%H %cd %s' | tee "$GITHUB_WORKSPACE/logs/recovery-commit.txt"
+        # every change the workflow made to the recovery sources
+        git -C bootable/recovery diff --stat | tee "$GITHUB_WORKSPACE/logs/recovery-patches.stat"
+        git -C bootable/recovery diff > "$GITHUB_WORKSPACE/logs/recovery-patches.diff" || true
 
     - name: Get bootable/recovery commit
       id: recovery_commit
@@ -896,6 +328,7 @@ jobs:
         cd "${{ env.SRC_DIR }}/bootable/recovery"
         COMMIT=$(git rev-parse --short=7 HEAD)
         echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+        echo "bootable/recovery: $COMMIT"
 
     - name: Clone device tree
       run: |
@@ -909,6 +342,490 @@ jobs:
         cd "${{ env.SRC_DIR }}/${{ env.DEVICE_PATH }}"
         COMMIT=$(git rev-parse --short=7 HEAD)
         echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+        echo "device tree: $COMMIT"
+
+    # Shell "patch": drops the probe script into the device tree's recovery
+    # ramdisk overlay and starts it from init. Idempotent (skips the rc edit if
+    # the service is already there). Output: /sdcard/browserlogs
+    - name: AERA - install browser/UI probe (writes /sdcard/browserlogs)
+      if: ${{ inputs.install_probe }}
+      run: |
+        set -e
+        D="${{ env.SRC_DIR }}/${{ env.DEVICE_PATH }}"
+        BIN="$D/recovery/root/system/bin"
+        RC="$D/recovery/root/init.recovery.services.rc"
+        [ -d "$D/recovery/root" ] || { echo "::error::$D/recovery/root not found"; exit 1; }
+        [ -f "$RC" ] || { echo "::error::$RC not found"; exit 1; }
+        mkdir -p "$BIN"
+        cat > "$BIN/aera_browser_probe.sh" <<'PROBE_EOF'
+        #!/system/bin/sh
+        # aera_browser_probe.sh  -  AERA recovery probe for the "sky" (Adreno 613) browser
+        #
+        # Does two jobs while the recovery runs:
+        #   1. Lists every browser / EGL / Zink / Turnip / Vulkan error that shows up in
+        #      recovery.log, with a stage-by-stage diagnosis.
+        #   2. Samples the UI frame rate by counting DRM page-flip and vblank events
+        #      from the kernel tracing interface (once per second).
+        #
+        # Output goes to /sdcard/browserlogs. Until /sdcard is writable (it is not before
+        # the data partition is decrypted) everything is spooled in /tmp/browserlogs and
+        # copied over as soon as the sdcard becomes usable.
+        #
+        #   browser_errors.log   every matching recovery.log line, timestamped
+        #   browser_summary.txt  diagnosis, rewritten whenever new lines arrive
+        #   fps_samples.csv      uptime_s,interval_ms,flips,vblanks,flip_fps_x10,vblank_hz_x10,
+        #                        sde_perf_update,sde_perf_calc,sde_underrun,msm_drm_irq_per_s_x10
+        #   trace_sample.txt     raw tracepoint lines from the first active seconds (to learn event formats)
+        #   fps_summary.txt      UI fps over active seconds, rewritten every 10 s
+        #   system_info.txt      one-time snapshot (renderer, GPU nodes, panel mode, tracing)
+        #
+        # Stop it:  touch /sdcard/browserlogs/STOP      (or: setprop ctl.stop aera-browser-probe)
+        # UI fps is only meaningful while the UI is changing: scroll or swipe while it runs.
+
+        PATH=/system/bin:/vendor/bin:/sbin:$PATH
+        export PATH
+
+        TMPOUT=${AERA_PROBE_TMP:-/tmp/browserlogs}
+        SDROOTS=${AERA_PROBE_SDROOTS:-"/sdcard /data/media/0"}
+        RLOGS=${AERA_PROBE_RLOG:-"/tmp/recovery.log /cache/recovery/log"}
+        TRACEDIRS=${AERA_PROBE_TRACE:-"/sys/kernel/tracing /sys/kernel/debug/tracing"}
+        PLUGIN_DIR=${AERA_PROBE_PLUGIN:-/sdcard/AERA/plugins/browser}
+        INTR=${AERA_PROBE_INTR:-/proc/interrupts}
+
+        ERR="$TMPOUT/browser_errors.log"
+        SUM="$TMPOUT/browser_summary.txt"
+        CSV="$TMPOUT/fps_samples.csv"
+        FPSSUM="$TMPOUT/fps_summary.txt"
+        INFO="$TMPOUT/system_info.txt"
+
+        # Lines worth keeping from recovery.log
+        BROWSER_RE='MESA-EGL|MESA:|ZINK|TU:|Adreno|libEGL|libGL:|Could not create surfaceless|EGL_NOT_INITIALIZED|dri2|Browser display|Invalid software browser|aera-browser|AERA-DEBUG|Vulkan Loader.*(ERROR|WARNING|freedreno|kgsl|[Ff]ailed)|Aborting|Unknown GPU|unsupported|not supported|Process ended with error'
+
+        up() { read -r _u _ < /proc/uptime; echo "${_u%.*}"; }
+        up_cs() {
+            read -r _u _ < /proc/uptime
+            _s=${_u%.*}
+            _f=${_u#*.}
+            _f=${_f#0}
+            [ -n "$_f" ] || _f=0
+            echo $((_s * 100 + _f))
+        }
+        stamp() { echo "[$(up)s $(date '+%H:%M:%S')]"; }
+
+        SD=""          # chosen sdcard root, empty until usable
+        SD_DONE_INFO=0
+
+        find_sd() {
+            SD=""
+            for r in $SDROOTS; do
+                if [ -d "$r/Android" ] || [ -d "$r/Download" ] || [ -d "$r/AERA" ]; then
+                    SD=$r
+                    return 0
+                fi
+            done
+            return 1
+        }
+
+        mirror() {
+            find_sd || return 1
+            dest="$SD/browserlogs"
+            mkdir -p "$dest" 2>/dev/null || return 1
+            [ -w "$dest" ] || return 1
+            cp -f "$TMPOUT"/* "$dest"/ 2>/dev/null
+            # media_rw ownership so Android file managers can read the files later
+            chown 1023:1023 "$dest" "$dest"/* 2>/dev/null
+            chmod 0775 "$dest" 2>/dev/null
+            chmod 0664 "$dest"/* 2>/dev/null
+            return 0
+        }
+
+        stop_requested() {
+            [ -e "$TMPOUT/STOP" ] && return 0
+            if [ -n "$SD" ] && [ -e "$SD/browserlogs/STOP" ]; then return 0; fi
+            return 1
+        }
+
+        pick_rlog() {
+            RLOG=""
+            for c in $RLOGS; do
+                if [ -r "$c" ]; then RLOG=$c; return 0; fi
+            done
+            return 1
+        }
+
+        write_sysinfo() {
+            {
+                echo "== AERA browser probe : system info =="
+                echo "date            : $(date '+%F %T')   uptime: $(up)s"
+                echo "kernel          : $(uname -a 2>/dev/null)"
+                echo "device/platform : $(getprop ro.product.device) / $(getprop ro.board.platform)"
+                echo "ro.hardware.egl : $(getprop ro.hardware.egl)"
+                echo "gfx allocator   : init.svc.aera-graphics-allocator=$(getprop init.svc.aera-graphics-allocator)"
+                echo
+                echo "-- GPU nodes --"
+                ls -l /dev/kgsl-3d0 /dev/dri 2>&1
+                echo
+                echo "-- vendor GPU userspace (UI renderer needs these) --"
+                ls /vendor/lib64/egl 2>&1
+                ls -l /vendor/lib64/libgsl.so 2>&1
+                echo
+                echo "-- browser plugin on sdcard --"
+                ls -l "$PLUGIN_DIR" 2>&1
+                grep -E '"version"|"payload_sha256"|"payload_size"' "$PLUGIN_DIR/plugin.json" 2>&1
+                echo
+                echo "-- UI renderer evidence in recovery.log --"
+                if pick_rlog; then
+                    grep -E 'display mode|DRM refresh|Using drm graphics|zero-copy|GPU ready|Adreno|renderer|GGL_PIXEL' "$RLOG" | head -20
+                    if grep -q -E 'zero-copy|GPU ready' "$RLOG"; then
+                        echo "verdict: UI looks GPU rendered (vendor EGL)"
+                    elif grep -q 'Using drm graphics' "$RLOG"; then
+                        echo "verdict: UI uses plain DRM drawing (CPU/software) - no GPU-ready message found"
+                    else
+                        echo "verdict: unknown"
+                    fi
+                else
+                    echo "recovery.log not found in: $RLOGS"
+                fi
+                echo
+                echo "-- tracing --"
+                echo "trace dir: ${T:-none}   fps mode: ${FPS_MODE:-none}"
+                for d in drm sde msm_drm; do
+                    [ -n "$T" ] && [ -d "$T/events/$d" ] && echo "events/$d: $(ls "$T/events/$d" | tr '\n' ' ')"
+                done
+                echo
+                echo "-- kernel GPU messages --"
+                dmesg 2>/dev/null | grep -i -E 'kgsl|a6xx|adreno|gmu|zap' | tail -30
+            } > "$INFO" 2>&1
+        }
+
+        # ---------------------------------------------------------------- browser errors
+        last_line=0
+        summarize() {
+            has() { grep -q -E "$1" "$ERR"; }
+            {
+                echo "AERA browser probe summary   $(date '+%F %T')   uptime $(up)s"
+                echo "browser aborts seen        : $(grep -c 'Could not create surfaceless' "$ERR")"
+                echo "Turnip instances created   : $(grep -c 'Created an instance' "$ERR")"
+                echo
+                echo "Diagnosis:"
+                if has 'AERA-DEBUG-CTOR'; then
+                    echo " - debug Turnip build is loaded (AERA-DEBUG-CTOR line present)"
+                else
+                    echo " - no AERA-DEBUG-CTOR line: the debug Turnip build is NOT the one running (or it is not loaded)"
+                fi
+                if has 'Found compatible device'; then
+                    echo " - Turnip found /dev/kgsl-3d0 and enumerated the GPU"
+                elif has 'TU:.*(Unknown GPU|unsupported|not supported|Unrecognized)'; then
+                    echo " - Turnip REJECTED the GPU (unknown or unsupported chip id) - see TU: lines below"
+                elif has 'TU:'; then
+                    echo " - Turnip started but never reported a compatible device"
+                else
+                    echo " - no TU: lines at all: Turnip never started (Vulkan loader / ICD problem)"
+                fi
+                if has 'ZINK'; then
+                    echo " - Zink printed its own error(s) - see ZINK lines below"
+                fi
+                if has 'failed to create dri2 screen'; then
+                    if has 'Found compatible device' && ! has 'ZINK'; then
+                        echo " - Vulkan device is fine but EGL could not create the Zink screen, and Zink printed nothing"
+                    else
+                        echo " - EGL could not create a DRI screen"
+                    fi
+                fi
+                if has 'surfaceless swrast'; then
+                    echo " - the software (swrast) fallback was tried; if it also fails the runtime has no software driver"
+                fi
+                if has 'Could not create surfaceless EGL display'; then
+                    echo " - the browser worker aborted: EGL_NOT_INITIALIZED"
+                fi
+                echo
+                echo "Last 25 matching lines:"
+                tail -n 25 "$ERR"
+            } > "$SUM"
+        }
+
+        scan_browser_log() {
+            pick_rlog || return 0
+            total=$(wc -l < "$RLOG")
+            total=$((total + 0))
+            [ "$total" -lt "$last_line" ] && last_line=0
+            [ "$total" -gt "$last_line" ] || return 0
+            tail -n +$((last_line + 1)) "$RLOG" | head -n $((total - last_line)) | grep -E "$BROWSER_RE" > "$TMPOUT/.hit"
+            last_line=$total
+            if [ -s "$TMPOUT/.hit" ]; then
+                s=$(stamp)
+                while IFS= read -r line; do
+                    echo "$s $line"
+                done < "$TMPOUT/.hit" >> "$ERR"
+                # keep the file bounded
+                n=$(wc -l < "$ERR")
+                [ "$n" -gt 6000 ] && { tail -n 4000 "$ERR" > "$TMPOUT/.e"; cat "$TMPOUT/.e" > "$ERR"; }
+                summarize
+                {
+                    echo "== kernel messages after browser activity ($(stamp)) =="
+                    dmesg 2>/dev/null | grep -i -E 'kgsl|dma_heap|aera-browser|avc: +denied.*(kgsl|aera)' | tail -15
+                } > "$TMPOUT/browser_kernel.log" 2>&1
+                mirror
+            fi
+        }
+
+        # ---------------------------------------------------------------------- UI fps
+        T=""
+        FPS_MODE=none
+        FPS_REASON=""
+        last_cs=0
+        all_tot=0; all_act=0; all_sum=0; all_max=0; all_vb=0; all_fl=0
+
+        setup_trace() {
+            T=""
+            for c in $TRACEDIRS; do
+                [ -d "$c/events" ] && { T=$c; break; }
+            done
+            if [ -z "$T" ]; then
+                mount -t tracefs nodev /sys/kernel/tracing 2>/dev/null
+                [ -d /sys/kernel/tracing/events ] && T=/sys/kernel/tracing
+            fi
+            if [ -z "$T" ]; then
+                mount -t debugfs nodev /sys/kernel/debug 2>/dev/null
+                [ -d /sys/kernel/debug/tracing/events ] && T=/sys/kernel/debug/tracing
+            fi
+            if [ -z "$T" ]; then
+                FPS_REASON="no tracefs/debugfs tracing interface in this kernel"
+                return 1
+            fi
+            echo 0 > "$T/tracing_on" 2>/dev/null
+            : > "$T/trace" 2>/dev/null
+            echo 2048 > "$T/buffer_size_kb" 2>/dev/null
+            ok=0
+            for ev in drm_vblank_event drm_vblank_event_delivered; do
+                if [ -w "$T/events/drm/$ev/enable" ]; then
+                    echo 1 > "$T/events/drm/$ev/enable" && ok=1
+                fi
+            done
+            # extra candidates: SDE commit-kick events fire even when the UI does not request DRM flip events
+            EXTRA_EVS=""
+            for ev in sde_perf_crtc_update sde_perf_calc_crtc sde_encoder_underrun; do
+                if [ -w "$T/events/sde/$ev/enable" ]; then
+                    echo 1 > "$T/events/sde/$ev/enable" && { ok=1; EXTRA_EVS="$EXTRA_EVS $ev"; }
+                fi
+            done
+            if [ "$ok" = 0 ]; then
+                FPS_REASON="tracing present but no drm:drm_vblank_event* or sde tracepoints (see system_info.txt)"
+                return 1
+            fi
+            echo 1 > "$T/tracing_on" 2>/dev/null
+            FPS_MODE=trace
+            last_cs=$(up_cs)
+            echo "uptime_s,interval_ms,flips,vblanks,flip_fps_x10,vblank_hz_x10,sde_perf_update,sde_perf_calc,sde_underrun,msm_drm_irq_per_s_x10" > "$CSV"
+            return 0
+        }
+
+        irq_msm() {
+            _sum=0
+            while read -r _l; do
+                case "$_l" in
+                    *msm_drm*)
+                        set -- $_l
+                        shift
+                        for _w in "$@"; do
+                            case "$_w" in
+                                ''|*[!0-9]*) break ;;
+                                *) _sum=$((_sum + _w)) ;;
+                            esac
+                        done
+                        ;;
+                esac
+            done < "$INTR"
+            echo "$_sum"
+        }
+        last_irq=0
+        sample_n=0
+        perf_act=0; perf_sum=0; perf_max=0; irq_max=0; irq_sum=0
+        trace_samples=0
+
+        fmt10() { echo "$(($1 / 10)).$(($1 % 10))"; }
+
+        sample_fps() {
+            [ "$FPS_MODE" = trace ] || return 0
+            now=$(up_cs)
+            cat "$T/trace" > "$TMPOUT/.tr" 2>/dev/null
+            : > "$T/trace" 2>/dev/null
+            fl=$(grep -c 'drm_vblank_event_delivered' "$TMPOUT/.tr")
+            vb=$(grep -c ' drm_vblank_event:' "$TMPOUT/.tr")
+            dt=$((now - last_cs))
+            [ "$dt" -gt 0 ] || dt=100
+            last_cs=$now
+            ffps=$((fl * 1000 * 100 / (dt * 100)))      # flips per second x10
+            ffps=$((fl * 10000 / (dt * 10)))
+            vhz=$((vb * 10000 / (dt * 10)))
+            pu=$(grep -c 'sde_perf_crtc_update' "$TMPOUT/.tr")
+            pc=$(grep -c 'sde_perf_calc_crtc' "$TMPOUT/.tr")
+            un=$(grep -c 'sde_encoder_underrun' "$TMPOUT/.tr")
+            irq=$(irq_msm)
+            irate=0
+            if [ "$last_irq" -gt 0 ] && [ "$irq" -ge "$last_irq" ]; then
+                irate=$(( (irq - last_irq) * 10000 / (dt * 10) ))
+            fi
+            last_irq=$irq
+            echo "$(up),$((dt * 10)),$fl,$vb,$ffps,$vhz,$pu,$pc,$un,$irate" >> "$CSV"
+            # keep a few raw trace snippets so the event formats can be inspected later
+            if [ "$trace_samples" -lt 5 ] && [ $((fl + vb + pu + pc + un)) -gt 0 ]; then
+                { echo "== $(stamp) =="; head -n 25 "$TMPOUT/.tr"; } >> "$TMPOUT/trace_sample.txt"
+                trace_samples=$((trace_samples + 1))
+            fi
+            sample_n=$((sample_n + 1))
+            puf=$((pu * 10000 / (dt * 10)))
+            if [ "$pu" -ge 3 ]; then
+                perf_act=$((perf_act + 1)); perf_sum=$((perf_sum + puf))
+                [ "$puf" -gt "$perf_max" ] && perf_max=$puf
+            fi
+            irq_sum=$((irq_sum + irate))
+            [ "$irate" -gt "$irq_max" ] && irq_max=$irate
+            all_tot=$((all_tot + 1))
+            all_vb=$((all_vb + vb))
+            all_fl=$((all_fl + fl))
+            if [ "$fl" -ge 3 ]; then
+                all_act=$((all_act + 1))
+                all_sum=$((all_sum + ffps))
+                [ "$ffps" -gt "$all_max" ] && all_max=$ffps
+            fi
+            n=$(wc -l < "$CSV")
+            [ "$n" -gt 20000 ] && { { head -n 1 "$CSV"; tail -n 10000 "$CSV"; } > "$TMPOUT/.c"; cat "$TMPOUT/.c" > "$CSV"; }
+        }
+
+        write_fps_summary() {
+            {
+                echo "AERA UI fps summary   $(date '+%F %T')   uptime $(up)s"
+                if [ "$FPS_MODE" != trace ]; then
+                    echo "UI fps could NOT be measured: $FPS_REASON"
+                    [ -r /sys/class/graphics/fb0/measured_fps ] && echo "fb0 measured_fps: $(cat /sys/class/graphics/fb0/measured_fps)"
+                    return 0
+                fi
+                echo "method: DRM page-flip events (drm_vblank_event_delivered) per second"
+                echo "seconds sampled           : $all_tot"
+                echo "seconds with UI activity  : $all_act   (>= 3 flips in that second)"
+                if [ "$all_act" -gt 0 ]; then
+                    echo "average UI fps (active)   : $(fmt10 $((all_sum / all_act)))"
+                    echo "peak UI fps               : $(fmt10 "$all_max")"
+                else
+                    echo "average UI fps (active)   : n/a - no active seconds yet. Scroll or swipe the UI."
+                fi
+                if [ "$all_tot" -gt 0 ]; then
+                    echo "vblank events per second  : $(fmt10 $((all_vb * 10 / all_tot))) average (only counted around display commits, NOT the panel refresh rate)"
+                fi
+                if [ "$all_act" = 0 ] && [ "$all_vb" = 0 ] && [ "$all_fl" = 0 ] && [ "$perf_act" = 0 ]; then
+                    echo "NOTE: zero display events so far. An idle UI does not commit frames, so this is"
+                    echo "      expected until you scroll, swipe or open a menu while the probe runs."
+                fi
+                if [ "$all_fl" = 0 ] && [ "$all_vb" -gt 0 ]; then
+                    echo "NOTE: vblanks are counted but no page-flip events: the UI may not request flip"
+                    echo "      events, so fps cannot be measured this way. See system_info.txt for other"
+                    echo "      tracepoints."
+                fi
+                echo
+                echo "SDE commit-kick events (sde_perf_crtc_update), fires even without DRM flip events:"
+                if [ "$perf_act" -gt 0 ]; then
+                    echo "  active seconds $perf_act, average $(fmt10 $((perf_sum / perf_act))) per s, peak $(fmt10 "$perf_max") per s"
+                else
+                    echo "  none seen (events enabled:${EXTRA_EVS:- none})"
+                fi
+                if [ "$sample_n" -gt 0 ]; then
+                    echo "msm_drm interrupts per second: average $(fmt10 $((irq_sum / sample_n))), peak $(fmt10 "$irq_max")"
+                    echo "  (hardware display IRQ; compare idle vs scrolling in fps_samples.csv)"
+                fi
+                echo
+                echo "last 60 s window:"
+                stats=$(tail -n 60 "$CSV" | {
+                    tot=0; act=0; sum=0; mx=0
+                    while IFS=, read -r u d f v p h; do
+                        case "$u" in uptime_s) continue;; esac
+                        tot=$((tot + 1))
+                        if [ "$f" -ge 3 ]; then
+                            act=$((act + 1)); sum=$((sum + p))
+                            [ "$p" -gt "$mx" ] && mx=$p
+                        fi
+                    done
+                    echo "$tot $act $sum $mx"
+                })
+                set -- $stats
+                if [ "${2:-0}" -gt 0 ]; then
+                    echo "  active seconds $2 of $1, average $(fmt10 $(($3 / $2))) fps, peak $(fmt10 "$4") fps"
+                else
+                    echo "  no UI activity in the last $1 s"
+                fi
+            } > "$FPSSUM" 2>&1
+        }
+
+        cleanup() {
+            if [ -n "$T" ]; then
+                for ev in drm_vblank_event drm_vblank_event_delivered; do
+                    echo 0 > "$T/events/drm/$ev/enable" 2>/dev/null
+                done
+            fi
+            write_fps_summary
+            summarize
+            mirror
+            exit 0
+        }
+
+        # ------------------------------------------------------------------------ main
+        mkdir -p "$TMPOUT"
+        rm -f "$TMPOUT/STOP"
+        : > "$ERR"
+        trap cleanup TERM INT HUP
+
+        setup_trace
+        write_sysinfo
+        write_fps_summary
+        summarize
+
+        loop=0
+        while :; do
+            sample_fps
+            [ $((loop % 2)) -eq 0 ] && scan_browser_log
+            if [ $((loop % 10)) -eq 0 ]; then
+                write_fps_summary
+                if mirror && [ "$SD_DONE_INFO" = 0 ]; then
+                    # first time the sdcard is usable: refresh the snapshot (plugin info needs /sdcard)
+                    write_sysinfo
+                    mirror
+                    SD_DONE_INFO=1
+                fi
+            fi
+            stop_requested && cleanup
+            loop=$((loop + 1))
+            sleep 1
+        done
+        PROBE_EOF
+        chmod 0755 "$BIN/aera_browser_probe.sh"
+        sh -n "$BIN/aera_browser_probe.sh"
+        if ! grep -q "aera-browser-probe" "$RC"; then
+          cat >> "$RC" <<'RC_EOF'
+
+        # >>> AERA browser/UI probe (writes /sdcard/browserlogs)
+        service aera-browser-probe /system/bin/sh /system/bin/aera_browser_probe.sh
+            class core
+            disabled
+            user root
+            group root
+            seclabel u:r:recovery:s0
+            stdio_to_kmsg
+
+        on boot
+            start aera-browser-probe
+        # AERA browser/UI probe <<<
+        RC_EOF
+        fi
+        ls -l "$BIN/aera_browser_probe.sh"
+        grep -n -A12 "AERA browser/UI probe (writes" "$RC"
+
+    - name: Record device tree changes (probe install)
+      if: always()
+      run: |
+        mkdir -p "$GITHUB_WORKSPACE/logs"
+        cd "${{ env.SRC_DIR }}/${{ env.DEVICE_PATH }}" 2>/dev/null || exit 0
+        git status --short | tee "$GITHUB_WORKSPACE/logs/devicetree-status.txt"
+        git diff > "$GITHUB_WORKSPACE/logs/devicetree-changes.diff" || true
 
     - name: Set swap space
       uses: pierotofy/set-swap-space@master
@@ -916,43 +833,53 @@ jobs:
         swap-size-gb: 30
 
     - name: Show system resources
-      run: nproc && free -h && df -h
+      run: |
+        nproc && free -h && df -h
 
     - name: Build recovery
       timeout-minutes: 240
       run: |
+        set -o pipefail
+        mkdir -p "$GITHUB_WORKSPACE/logs"
         cd "${{ env.SRC_DIR }}"
+
         set +e
         source build/envsetup.sh
         set -e
+
         export ALLOW_MISSING_DEPENDENCIES=true
         lunch ${{ env.MAKEFILE_NAME }}
-        mka adbd ${{ env.BUILD_TARGET }}image -j$(nproc --all)
 
-    - name: Upload build logs on failure
-      if: failure()
+        # full console output is also kept as an artifact (recovery-build-logs)
+        mka adbd ${{ env.BUILD_TARGET }}image -j$(nproc --all) 2>&1 | tee "$GITHUB_WORKSPACE/logs/mka.log"
+
+    - name: Upload recovery build logs (always)
+      if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: build-logs
+        name: recovery-build-logs
         path: |
+          logs/
           ${{ env.SRC_DIR }}/out/error.log
           ${{ env.SRC_DIR }}/out/verbose.log.gz
           ${{ env.SRC_DIR }}/out/soong.log
+          ${{ env.SRC_DIR }}/out/build.trace.gz
+          ${{ env.SRC_DIR }}/out/.ninja_log
         if-no-files-found: ignore
 
-    - name: Check patches made it into the build (non-fatal)
+    # Non-fatal: confirms the debug strings actually made it into the built
+    # recovery (the jail launcher is compiled into it). A warning here means
+    # the patched file is not part of this product's build.
+    - name: Check verbose browser env made it into the build
+      if: ${{ inputs.verbose_browser }}
       run: |
         D="${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}"
-        check() {
-          if grep -rlaF "$1" "$D/recovery" "$D/symbols" 2>/dev/null | head -1 | grep -q .; then
-            echo "OK: $1 found in the built recovery"
-          else
-            echo "::warning::$1 not found in the built recovery; the patched file may not be compiled into this product."
-          fi
-        }
-        [ "${{ inputs.verbose_browser }}" = true ] && check "VK_LOADER_DEBUG=all"
-        [ "${{ inputs.llvmpipe_fallback }}" = true ] && check "LP_NUM_THREADS=6"
-        true
+        if grep -rlaF "VK_LOADER_DEBUG=all" "$D/recovery" "$D/symbols" 2>/dev/null | head -3 | grep -q .; then
+          echo "OK: VK_LOADER_DEBUG=all found in the built recovery"
+          grep -rlaF "VK_LOADER_DEBUG=all" "$D/recovery" "$D/symbols" 2>/dev/null | head -3
+        else
+          echo "::warning::VK_LOADER_DEBUG=all not found in the built recovery; the patched jail file may not be compiled into this product."
+        fi
 
     - name: Verify the flashable zip
       run: |
@@ -976,6 +903,17 @@ jobs:
     - name: Check the output directory
       run: ls -l "${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/"
 
+    - name: Upload recovery images as an artifact (in case the release step fails)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: recovery-images
+        path: |
+          ${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.img
+          ${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.zip
+          ${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.zip.md5
+        if-no-files-found: ignore
+
     - name: Upload to release
       uses: softprops/action-gh-release@v3
       with:
@@ -995,6 +933,700 @@ jobs:
           Device tree commit: [${{ steps.devtree_commit.outputs.commit }}](${{ env.DEVICE_TREE_WEB }}/tree/${{ steps.devtree_commit.outputs.commit }})
           bootable/recovery commit: [${{ steps.recovery_commit.outputs.commit }}](https://github.com/AERA-Recovery/android_bootable_recovery/tree/${{ steps.recovery_commit.outputs.commit }})
           Verbose browser logging: ${{ inputs.verbose_browser }}
-          llvmpipe fallback: ${{ inputs.llvmpipe_fallback }}
+          Probe installed: ${{ inputs.install_probe }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ===========================================================================
+  # BROWSER PLUGIN (runs after the recovery job; never fails the workflow)
+  #   1) browser_build  : Turnip (Adreno 613) + optional instrumented Mesa EGL/Zink/softpipe
+  #   2) browser_package: overlay onto the published runtime, pack, build the .aerap
+  # ===========================================================================
+  browser_build:
+    needs: recovery
+    if: ${{ !cancelled() && inputs.build_browser && github.event.repository.owner.id == github.event.sender.id }}
+    continue-on-error: true
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    env:
+      MESA_VERSION: "26.2.2"
+      # Redmi "sky" (ravelin): qcom,chipid = <0x06010300>, Adreno613v1 (gen6_3_26_0).
+      A613_CHIP_ID: "0x06010300"
+      ADD_SOFTPIPE: ${{ inputs.add_softpipe && '1' || '0' }}
+      INSTRUMENT_MESA: ${{ inputs.instrument_mesa && '1' || '0' }}
+    steps:
+      - name: Runner and tool versions
+        run: |
+          set -x
+          uname -a
+          nproc
+          free -h
+          df -h
+          docker --version
+          python3 --version
+
+      - name: Fetch AERA browser plugin sources (AERA-Plugins/browser)
+        run: |
+          git clone --depth 1 https://github.com/AERA-Plugins/browser.git browser-src
+          cd browser-src
+          mkdir -p logs
+          git log -1 --format='%H %cd %s' | tee logs/browser-src-commit.txt
+          python3 -m json.tool plugin.json | head -30
+          ls -R source | head -60
+
+      - name: Shell + Python syntax (browser sources)
+        run: |
+          cd browser-src
+          for f in source/*.sh; do bash -n "$f"; done
+          python3 -m py_compile source/pack.py
+
+      - name: Download Mesa and add Adreno 613 (Turnip tree)
+        run: |
+          cd browser-src
+          curl -fsSL "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" | tar -xJ
+          mv "mesa-${MESA_VERSION}" mesa-src
+          cd mesa-src
+          dev=src/freedreno/common/freedreno_devices.py
+          echo "--- existing 613 / 0x0601 entries in the upstream table (informational) ---"
+          grep -n -E '613|0x0601[0-9a-f]{4}' "$dev" || true
+          python3 - "$dev" <<'PY'
+          import os, re, sys
+          p = sys.argv[1]
+          s = open(p).read()
+          if "Adreno (TM) 613" in s:
+              print("Adreno (TM) 613 already present; not inserting")
+              sys.exit(0)
+          m = re.search(r'^([ \t]*)GPUId\(612\),\n', s, re.M)
+          if not m:
+              print("::error::GPUId(612) anchor not found")
+              sys.exit(1)
+          ind = m.group(1)
+          cid = os.environ["A613_CHIP_ID"]
+          name = '"Adreno (TM) 613"'
+          ids = [
+              f'GPUId(613, name={name})',
+              f'GPUId(chip_id={cid}, name={name})',
+              f'GPUId(chip_id=0xffff{cid[2:]}, name={name})',
+          ]
+          add = "".join(f"{ind}{i},\n" for i in ids)
+          s = s[:m.end()] + add + s[m.end():]
+          open(p, "w").write(s)
+          print("inserted Adreno 613 entries")
+          PY
+          grep -n -B3 -A6 'Adreno (TM) 613' "$dev"
+
+      # A constructor compiled into the Turnip library itself: raises Mesa's log
+      # level and prints a marker line, so recovery.log proves THIS driver ran.
+      - name: Add debug environment constructor to Turnip
+        run: |
+          cd browser-src
+          f=mesa-src/src/freedreno/vulkan/tu_util.cc
+          [ -f "$f" ] || f=mesa-src/src/freedreno/vulkan/tu_device.cc
+          [ -f "$f" ] || { echo "::error::no Turnip source file found for the debug constructor"; exit 1; }
+          cat >> "$f" <<'EOF4'
+
+          /* AERA debug: surface Zink/Mesa error messages in recovery.log */
+          #include <stdlib.h>
+          #include <stdio.h>
+          __attribute__((constructor, used)) static void aera_debug_env_ctor(void)
+          {
+             /* The marker is used by code, so the linker cannot drop it. */
+             setenv("AERA_DEBUG_ENV_CTOR", "1", 0);
+             setenv("MESA_LOG_LEVEL", "debug", 0);
+             setenv("TU_DEBUG", "startup", 0);
+             /* Visible proof in recovery.log that this exact driver build ran. */
+             fputs("AERA-DEBUG-CTOR: Turnip loaded, MESA_LOG_LEVEL set\n", stderr);
+             fflush(stderr);
+          }
+          EOF4
+          tail -16 "$f"
+
+      - name: Build libvulkan_freedreno.so (Alpine / musl, verbose)
+        run: |
+          set -o pipefail
+          cd browser-src
+          cat > build-in-alpine.sh <<'SCRIPT'
+          set -eux
+          apk add --no-cache \
+            bash coreutils patch grep sed curl xz git \
+            build-base linux-headers meson samurai pkgconf \
+            python3 py3-mako py3-yaml py3-packaging py3-setuptools \
+            flex bison glslang vulkan-headers \
+            zlib-dev zstd-dev expat-dev libdrm-dev libxml2-dev
+
+          cat > /tmp/cross.ini <<'EOF2'
+          [binaries]
+          c = 'gcc'
+          cpp = 'g++'
+          ar = 'ar'
+          strip = 'strip'
+          pkg-config = 'pkg-config'
+
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+
+          [properties]
+          needs_exe_wrapper = false
+          EOF2
+
+          # samu -v prints every compile command (full verbose build log)
+          printf '#!/bin/sh\nexec samu -v "$@"\n' > /usr/local/bin/samu-v
+          chmod +x /usr/local/bin/samu-v
+          export NINJA=/usr/local/bin/samu-v
+          export AERA_BROWSER_JOBS="$(nproc)"
+          mkdir -p /work/logs /work/out
+          bash source/build-turnip-a825.sh /work/mesa-src /work/mesa-build /tmp/cross.ini || {
+            cp /work/mesa-build/meson-logs/meson-log.txt /work/logs/turnip-meson-log.txt 2>/dev/null || true
+            exit 1
+          }
+          cp /work/mesa-build/meson-logs/meson-log.txt /work/logs/turnip-meson-log.txt || true
+          cp /work/mesa-build/src/freedreno/vulkan/libvulkan_freedreno.so /work/out/
+          strip --strip-unneeded /work/out/libvulkan_freedreno.so
+          ls -l /work/out
+          SCRIPT
+          docker run --rm -v "$PWD":/work -w /work alpine:3.22 sh build-in-alpine.sh 2>&1 | tee logs/turnip-build.log
+
+      - name: Verify the built Turnip driver
+        run: |
+          cd browser-src
+          sudo apt-get install -y binutils >/dev/null
+          lib=out/libvulkan_freedreno.so
+          strings "$lib" | grep -F 'Adreno (TM) 613' \
+            || { echo "::error::Adreno (TM) 613 not present in built driver"; exit 1; }
+          for n in 'Adreno (TM) 722' 'Adreno (TM) 825'; do
+            strings "$lib" | grep -qF "$n" || { echo "::error::$n missing from built driver"; exit 1; }
+          done
+          echo "OK: 613 / 722 / 825 present"
+          strings "$lib" | grep -qF 'AERA_DEBUG_ENV_CTOR' \
+            || { echo "::error::debug constructor missing from built driver"; exit 1; }
+          echo "OK: debug constructor present"
+          readelf -d "$lib" | grep -E 'NEEDED|SONAME'
+          sha256sum "$lib" | tee logs/turnip-sha256.txt
+
+      - name: Upload Turnip driver
+        uses: actions/upload-artifact@v4
+        with:
+          name: turnip
+          path: browser-src/out/libvulkan_freedreno.so
+          if-no-files-found: error
+
+      # ---- experimental: the runtime's EGL/Zink is a separate Mesa build. This
+      # rebuilds it from the repo recipe (EGL, GLES2, Zink, surfaceless, no LLVM)
+      # with (a) AERA-FAIL prints at every screen-creation failure exit and
+      # (b) softpipe so Mesa's software fallback has a driver. Tries instrumented
+      # first, then plain, with and without the 'surfaceless' platform option.
+      # A failure here is non-fatal: the package job just keeps the stock EGL/Zink.
+      - name: Write Mesa instrumentation script
+        if: ${{ inputs.instrument_mesa || inputs.add_softpipe }}
+        run: |
+          cd browser-src
+          cat > instrument_mesa.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """AERA: make Mesa's EGL / DRI frontend / Zink screen-creation paths say WHY they fail.
+
+          Every failure exit (goto fail/err/cleanup, and `return NULL/false/EGL_FALSE` inside the
+          screen-creation functions) gets a fprintf(stderr, "AERA-FAIL file:line in func()") in front
+          of it. Nothing is printed on the success path. Missing files/functions are skipped and
+          reported, never fatal.
+          """
+          import re
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+
+          # file -> set of function names whose `return NULL/false/EGL_FALSE` are instrumented
+          # (None = no function-scoped returns, gotos only)
+          TARGETS = {
+              "src/gallium/drivers/zink/zink_screen.c": {
+                  "zink_internal_create_screen", "zink_create_screen", "zink_drm_create_screen",
+                  "choose_pdev", "zink_create_logical_device", "create_logical_device",
+                  "zink_get_physical_device_info", "init_driver_workarounds", "zink_screen_init_compiler",
+                  "zink_get_display_device", "zink_init_screen_resource_functions",
+              },
+              "src/gallium/drivers/zink/zink_instance.c": {"zink_create_instance"},
+              "src/gallium/frontends/dri/dri_util.c": {
+                  "driCreateNewScreen3", "driCreateNewScreen2", "driCreateNewScreen",
+                  "driCreateNewScreen3_", "dri_create_new_screen",
+              },
+              "src/gallium/frontends/dri/dri_screen.c": {
+                  "dri_init_screen", "dri_create_new_screen", "dri_screen_init_cb",
+              },
+              "src/gallium/frontends/dri/drisw.c": {
+                  "drisw_init_screen", "drisw_create_new_screen", "dri_swrast_kms_init_screen",
+              },
+              "src/gallium/frontends/dri/kopper.c": {"kopper_init_screen", "kopper_create_new_screen"},
+              "src/gallium/frontends/dri/dri2.c": {"dri2_init_screen", "dri2_create_new_screen"},
+              "src/gallium/auxiliary/pipe-loader/pipe_loader_sw.c": {
+                  "pipe_loader_sw_probe_dri", "pipe_loader_sw_probe_init_common",
+                  "pipe_loader_sw_create_screen", "pipe_loader_sw_probe_kms",
+              },
+              "src/gallium/auxiliary/target-helpers/sw_helper.h": {
+                  "sw_screen_create_vk", "sw_screen_create_zink", "sw_screen_create_named",
+                  "sw_screen_create", "sw_screen_create_zink_",
+              },
+              "src/egl/drivers/dri2/egl_dri2.c": {
+                  "dri2_create_screen", "dri2_setup_screen", "dri2_load_driver_common",
+                  "dri2_load_driver", "dri2_load_driver_swrast", "dri2_load_driver_dri3",
+                  "dri2_get_driver_extensions", "dri2_initialize", "dri2_init_screen_extensions",
+              },
+              "src/egl/drivers/dri2/platform_surfaceless.c": None,   # small file: everything
+          }
+
+          GOTO = re.compile(r"\bgoto\s+((?:fail|err|error|cleanup|out_err|bail)\w*)\s*;")
+          RET = re.compile(r"\breturn\s+(NULL|false|EGL_FALSE)\s*;")
+          FUNC_NAME = re.compile(r"^(?:[A-Za-z_][\w \t\*]*?[ \t\*])?([A-Za-z_]\w*)\s*\(")
+
+
+          def note(name, label):
+              return ('{ fprintf(stderr, "AERA-FAIL %s:%d in %s() -> ' + label +
+                      '\\n", __FILE__, __LINE__, __func__); ')
+
+
+          def instrument(text, funcs, whole_file_returns):
+              out = []
+              lines = text.split("\n")
+              cur = None          # current function name while inside a body
+              pending = None      # name seen at col 0, waiting for the '{' line
+              depth_open = False
+              n_goto = n_ret = 0
+              for ln in lines:
+                  if not depth_open:
+                      m = FUNC_NAME.match(ln) if ln and not ln[0].isspace() and not ln.startswith(("#", "/", "*", "}")) else None
+                      if m and "=" not in ln.split("(")[0] and not ln.rstrip().endswith(";"):
+                          pending = m.group(1)
+                      if ln.strip() == "{" and not ln[0].isspace() and pending:
+                          cur = pending
+                          depth_open = True
+                          pending = None
+                      elif ln.startswith("{") and pending:
+                          cur = pending
+                          depth_open = True
+                          pending = None
+                  elif ln.startswith("}"):
+                      depth_open = False
+                      cur = None
+
+                  def goto_sub(mm):
+                      global_n[0] += 1
+                      return note(cur or "?", mm.group(1)) + "goto " + mm.group(1) + "; }"
+
+                  def ret_sub(mm):
+                      global_n[1] += 1
+                      return note(cur or "?", "return " + mm.group(1)) + "return " + mm.group(1) + "; }"
+
+                  global_n = [0, 0]
+                  new = ln
+                  if "AERA-FAIL" not in new:
+                      new = GOTO.sub(goto_sub, new)
+                      if whole_file_returns or (cur is not None and funcs and cur in funcs):
+                          new = RET.sub(ret_sub, new)
+                  n_goto += global_n[0]
+                  n_ret += global_n[1]
+                  out.append(new)
+              return "\n".join(out), n_goto, n_ret
+
+
+          total = 0
+          already = 0
+          for rel, funcs in TARGETS.items():
+              p = root / rel
+              if not p.is_file():
+                  print(f"skip (missing): {rel}")
+                  continue
+              s = p.read_text()
+              if "AERA-FAIL" in s:
+                  print(f"already instrumented: {rel}")
+                  already += 1
+                  continue
+              new, g, r = instrument(s, funcs or set(), funcs is None)
+              if g + r:
+                  new = "#include <stdio.h>\n" + new
+                  p.write_text(new)
+              print(f"instrumented {rel}: {g} goto, {r} return")
+              total += g + r
+          print(f"total failure exits instrumented: {total}")
+          if total == 0 and already == 0:
+              sys.exit("nothing instrumented - Mesa source layout differs from what this script expects")
+          PYEOF
+          python3 -m py_compile instrument_mesa.py
+
+      - name: Build Mesa EGL + Zink (+ softpipe, instrumented) [experimental]
+        id: mesa_egl
+        if: ${{ inputs.instrument_mesa || inputs.add_softpipe }}
+        continue-on-error: true
+        timeout-minutes: 150
+        run: |
+          set -o pipefail
+          cd browser-src
+          mkdir -p logs
+          curl -fsSL "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" | tar -xJ
+          mv "mesa-${MESA_VERSION}" mesa-egl-pristine
+          patch -d mesa-egl-pristine -p1 -i "$PWD/source/patches/mesa-${MESA_VERSION}-zink-kgsl-surfaceless"*.patch
+          cat > build-egl-in-alpine.sh <<'SCRIPT'
+          set -eux
+          apk add --no-cache \
+            bash coreutils patch grep sed curl xz git \
+            build-base linux-headers meson samurai pkgconf \
+            python3 py3-mako py3-yaml py3-packaging py3-setuptools \
+            flex bison glslang vulkan-headers \
+            zlib-dev zstd-dev expat-dev libdrm-dev libxml2-dev
+
+          cat > /tmp/cross.ini <<'EOF2'
+          [binaries]
+          c = 'gcc'
+          cpp = 'g++'
+          ar = 'ar'
+          strip = 'strip'
+          pkg-config = 'pkg-config'
+
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+
+          [properties]
+          needs_exe_wrapper = false
+          EOF2
+
+          GALLIUM=zink
+          [ "$ADD_SOFTPIPE" = 1 ] && GALLIUM=zink,softpipe
+          mkdir -p /work/logs
+
+          try_build() {
+            inst=$1
+            plat=$2
+            tag="instrument${inst}-platforms_${plat:-none}-gallium_${GALLIUM}"
+            echo "=============== attempt: $tag ==============="
+            rm -rf /work/mesa-egl /work/mesa-egl-build /work/egl-install
+            cp -a /work/mesa-egl-pristine /work/mesa-egl || return 1
+            if [ "$inst" = 1 ]; then
+              python3 /work/instrument_mesa.py /work/mesa-egl || return 1
+            fi
+            meson setup /work/mesa-egl-build /work/mesa-egl \
+              --cross-file /tmp/cross.ini \
+              -Dprefix=/usr -Dlibdir=lib -Dbuildtype=release \
+              -Dgallium-drivers=$GALLIUM -Dvulkan-drivers= -Dplatforms=$plat \
+              -Degl=enabled -Dgles1=disabled -Dgles2=enabled -Dopengl=false \
+              -Dglx=disabled -Dgbm=disabled -Dllvm=disabled -Dvideo-codecs= \
+              -Dbuild-tests=false -Dglvnd=disabled || {
+                cp /work/mesa-egl-build/meson-logs/meson-log.txt "/work/logs/mesa-egl-meson-fail-$tag.txt" 2>/dev/null
+                return 1
+              }
+            samu -v -C /work/mesa-egl-build || return 1
+            DESTDIR=/work/egl-install meson install -C /work/mesa-egl-build --no-rebuild || return 1
+            find /work/egl-install -name '*.so*' -exec strip --strip-unneeded {} + 2>/dev/null
+            cp /work/mesa-egl-build/meson-logs/meson-log.txt "/work/logs/mesa-egl-meson-ok-$tag.txt" 2>/dev/null
+            echo "$tag" > /work/egl-install/BUILD_TAG
+            return 0
+          }
+
+          for inst in $( [ "$INSTRUMENT_MESA" = 1 ] && echo "1 0" || echo "0" ); do
+            for plat in surfaceless ""; do
+              if try_build "$inst" "$plat"; then
+                echo "SUCCESS: $(cat /work/egl-install/BUILD_TAG)"
+                exit 0
+              fi
+            done
+          done
+          echo "all Mesa EGL/Zink build variants failed"
+          exit 1
+          SCRIPT
+          docker run --rm -e ADD_SOFTPIPE -e INSTRUMENT_MESA -v "$PWD":/work -w /work alpine:3.22 sh build-egl-in-alpine.sh 2>&1 | tee logs/mesa-egl-build.log
+
+      - name: Collect Mesa EGL/Zink output
+        if: ${{ steps.mesa_egl.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          cd browser-src
+          sudo chown -R "$(id -u):$(id -g)" egl-install
+          cat egl-install/BUILD_TAG | tee logs/mesa-egl-build-tag.txt
+          lib=egl-install/usr/lib
+          find egl-install -type f -o -type l | sort | head -80
+          mkdir -p egl-out
+          cp -L "$lib"/libEGL.so.1 egl-out/libEGL.so.1
+          cp -L "$lib"/libGLESv2.so.2 egl-out/libGLESv2.so.2
+          cp -L "$lib"/libgallium-*.so egl-out/libgallium.so
+          : > egl-out/dri-names.txt
+          for n in zink swrast kms_swrast; do
+            [ -e "$lib/dri/${n}_dri.so" ] && echo "$n" >> egl-out/dri-names.txt
+          done
+          cat egl-out/dri-names.txt
+          cp egl-install/BUILD_TAG egl-out/BUILD_TAG
+          for f in egl-out/*.so*; do
+            echo "== $f"; readelf -d "$f" | grep -E 'NEEDED|SONAME'; ls -l "$f"
+          done
+          echo "AERA-FAIL markers in libgallium: $(strings egl-out/libgallium.so | grep -c 'AERA-FAIL' || true)"
+          sha256sum egl-out/* | tee logs/mesa-egl-sha256.txt
+
+      - name: Upload Mesa EGL/Zink output
+        if: ${{ steps.mesa_egl.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-egl
+          path: browser-src/egl-out
+          if-no-files-found: error
+
+      - name: Upload browser build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-build-logs
+          path: browser-src/logs
+          if-no-files-found: ignore
+
+  browser_package:
+    needs: browser_build
+    if: ${{ !cancelled() && needs.browser_build.result == 'success' }}
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      STAGED_RUNTIME_URL: ${{ inputs.staged_runtime_url || vars.STAGED_RUNTIME_URL }}
+      STAGED_RUNTIME_TOKEN: ${{ secrets.STAGED_RUNTIME_TOKEN }}
+    steps:
+      - name: Fetch AERA browser plugin sources (AERA-Plugins/browser)
+        run: |
+          git clone --depth 1 https://github.com/AERA-Plugins/browser.git browser-src
+          mkdir -p browser-src/logs
+
+      - name: Resolve plugin version (must differ from plugin.json)
+        run: |
+          cd browser-src
+          ver="${{ inputs.plugin_version }}"
+          cur=$(python3 -c "import json;print(json.load(open('plugin.json'))['version'])")
+          if [ -z "$ver" ]; then
+            ver="1.6.${GITHUB_RUN_NUMBER}"
+            echo "No plugin_version input; using $ver (repo plugin.json is $cur)"
+          fi
+          if [ "$ver" = "$cur" ]; then
+            echo "::error::Version $ver equals plugin.json ($cur). Pick another."
+            exit 1
+          fi
+          echo "PLUGIN_VERSION=$ver" >> "$GITHUB_ENV"
+          echo "Building plugin version $ver (was $cur)"
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y xz-utils zstd xxd binutils
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: turnip
+          path: browser-src/turnip
+
+      - name: Download Mesa EGL/Zink build (if it was produced)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: mesa-egl
+          path: browser-src/mesa-egl
+
+      - name: Fetch base runtime
+        run: |
+          cd browser-src
+          mkdir stage
+          if [ -n "${STAGED_RUNTIME_URL:-}" ]; then
+            auth=()
+            [ -n "${STAGED_RUNTIME_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $STAGED_RUNTIME_TOKEN")
+            curl -fsSL "${auth[@]}" -o stage.tar "$STAGED_RUNTIME_URL"
+            # Symlinks (musl loader alias) must survive extraction; pack.py resolves them.
+            tar --no-same-owner -xf stage.tar -C stage
+            if [ "$(ls -A stage | wc -l)" = 1 ] && [ -d "stage/$(ls stage)" ]; then
+              mv "stage/$(ls stage)" stage-root && rm -rf stage && mv stage-root stage
+            fi
+          else
+            # No staged tarball given: start from the currently published runtime
+            # named in plugin.json, so only the replaced libraries change.
+            url=$(python3 -c "import json;print(json.load(open('plugin.json'))['payload_url'])")
+            want=$(python3 -c "import json;print(json.load(open('plugin.json'))['payload_sha256'])")
+            echo "STAGED_RUNTIME_URL not set; using published runtime: $url"
+            curl -fsSL -o base-runtime.xz "$url"
+            echo "$want  base-runtime.xz" | sha256sum -c -
+            python3 - base-runtime.xz stage <<'PY'
+          import os, struct, subprocess, sys
+
+          src, dest = sys.argv[1], sys.argv[2]
+          raw = subprocess.run(["xz", "-dc", src], check=True, stdout=subprocess.PIPE).stdout
+          if raw[:8] != b"AERAWEB1":
+              sys.exit("not an AERA runtime payload")
+          count = struct.unpack_from("<I", raw, 8)[0]
+          pos = 12
+          root = os.path.realpath(dest)
+          for _ in range(count):
+              nlen, mode, size = struct.unpack_from("<HHQ", raw, pos)
+              pos += 12
+              name = raw[pos:pos + nlen].decode("utf-8")
+              pos += nlen
+              pos += -pos % 4
+              data = raw[pos:pos + size]
+              pos += size
+              if name.startswith("/") or any(p in ("", ".", "..") for p in name.split("/")):
+                  sys.exit(f"unsafe path in payload: {name}")
+              path = os.path.join(root, name)
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              if mode == 0:  # symlink; payload stores the target relative to the runtime root
+                  target = os.path.relpath(os.path.join(root, data.decode()), os.path.dirname(path))
+                  os.symlink(target, path)
+              else:
+                  with open(path, "wb") as f:
+                      f.write(data)
+                  os.chmod(path, mode)
+          if pos != len(raw):
+              sys.exit("trailing bytes in payload")
+          print(f"unpacked {count} members")
+          PY
+          fi
+          find stage -type f | wc -l
+
+      - name: Replace Turnip driver in staged runtime
+        run: |
+          cd browser-src
+          mapfile -t hits < <(find stage -name libvulkan_freedreno.so -type f)
+          if [ "${#hits[@]}" -eq 0 ]; then
+            echo "::error::libvulkan_freedreno.so not found in staged runtime"; exit 1
+          fi
+          for h in "${hits[@]}"; do
+            echo "replacing $h"
+            install -m 0755 turnip/libvulkan_freedreno.so "$h"
+            strings "$h" | grep -qF 'Adreno (TM) 613' \
+              || { echo "::error::$h lacks Adreno 613 after replace"; exit 1; }
+            strings "$h" | grep -qF 'AERA-DEBUG-CTOR' \
+              || { echo "::error::$h lacks the debug constructor after replace"; exit 1; }
+          done
+
+      # Non-fatal. Swaps the runtime's EGL/GLES/Zink libraries for the rebuilt ones
+      # only when every dependency is already present in the runtime.
+      - name: Swap in rebuilt Mesa EGL/Zink (+softpipe) if available
+        continue-on-error: true
+        run: |
+          cd browser-src
+          if [ ! -f mesa-egl/libgallium.so ]; then
+            echo "No rebuilt Mesa EGL/Zink artifact; keeping the runtime's own EGL/Zink."
+            exit 0
+          fi
+          cat mesa-egl/BUILD_TAG
+          zd=$(find stage -name zink_dri.so -type f | head -1)
+          [ -n "$zd" ] || { echo "::warning::zink_dri.so not found in runtime; skipping Mesa swap"; exit 0; }
+          libdir=$(dirname "$(dirname "$zd")")
+          for f in libEGL.so.1 libGLESv2.so.2; do
+            [ -f "$libdir/$f" ] || { echo "::warning::$libdir/$f missing; skipping Mesa swap"; exit 0; }
+          done
+          soname=$(readelf -d mesa-egl/libgallium.so | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')
+          echo "new libgallium SONAME: $soname"
+          [ "$soname" = "libgallium-26.2.2.so" ] || { echo "::warning::unexpected SONAME; skipping Mesa swap"; exit 0; }
+          missing=0
+          for f in mesa-egl/libEGL.so.1 mesa-egl/libGLESv2.so.2 mesa-egl/libgallium.so; do
+            for n in $(readelf -d "$f" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p'); do
+              if [ ! -e "$libdir/$n" ] && [ "$n" != "libgallium-26.2.2.so" ]; then
+                echo "::warning::$f needs $n, which the runtime does not have"
+                missing=1
+              fi
+            done
+          done
+          [ "$missing" = 0 ] || { echo "::warning::dependency closure not satisfied; skipping Mesa swap"; exit 0; }
+          size=$(stat -c%s mesa-egl/libgallium.so)
+          [ "$size" -lt 100000000 ] || { echo "::warning::libgallium too large for the payload limit; skipping"; exit 0; }
+          install -m 0755 mesa-egl/libgallium.so "$zd"
+          install -m 0755 mesa-egl/libEGL.so.1 "$libdir/libEGL.so.1"
+          install -m 0755 mesa-egl/libGLESv2.so.2 "$libdir/libGLESv2.so.2"
+          if grep -qx swrast mesa-egl/dri-names.txt; then
+            ln -sf zink_dri.so "$(dirname "$zd")/swrast_dri.so"
+            ln -sf zink_dri.so "$(dirname "$zd")/kms_swrast_dri.so"
+            echo "added software (softpipe) DRI driver aliases"
+          fi
+          echo "MESA_SWAPPED=1" >> "$GITHUB_ENV"
+          ls -l "$(dirname "$zd")" "$libdir/libEGL.so.1" "$libdir/libGLESv2.so.2"
+
+      - name: Pack runtime.xz
+        run: cd browser-src && python3 source/pack.py stage build
+
+      - name: Update plugin.json
+        run: |
+          cd browser-src
+          python3 - "$PLUGIN_VERSION" <<'PY'
+          import hashlib, json, os, re, sys
+          ver = sys.argv[1]
+          hpp = open("build/aera_browser_payload.hpp").read()
+          num = lambda k: int(re.search(rf"{k}\s*=\s*(\d+)", hpp).group(1))
+          txt = lambda k: re.search(rf'{k}\[\]\s*=\s*"([0-9a-f]+)"', hpp).group(1)
+          p = json.load(open("plugin.json"))
+          p["version"] = ver
+          p["payload_url"] = (f"https://github.com/{os.environ['GITHUB_REPOSITORY']}"
+                              f"/releases/download/v{ver}/runtime.xz")
+          p["payload_size"]    = num("kCompressedBytes")
+          p["payload_sha256"]  = txt("kCompressedHash")
+          p["expanded_size"]   = num("kExpandedBytes")
+          p["expanded_sha256"] = txt("kExpandedHash")
+          p["member_count"]    = num("kMemberCount")
+          assert hashlib.sha256(open("build/runtime.xz","rb").read()).hexdigest() == p["payload_sha256"]
+          json.dump(p, open("build/plugin.json","w"), indent=2, ensure_ascii=False)
+          open("build/plugin.json","a").write("\n")
+          PY
+          head -20 build/plugin.json
+
+      # Unsigned: installable from the recovery Files app after a security warning.
+      - name: Build unofficial .aerap package
+        run: |
+          cd browser-src
+          git clone --depth 1 https://github.com/AERA-Plugins/registry.git /tmp/registry
+          python3 /tmp/registry/scripts/package_aerap.py \
+            --manifest build/plugin.json \
+            --payload build/runtime.xz \
+            --output "build/AERA-Browser-${PLUGIN_VERSION}.aerap"
+          ls -l build/*.aerap
+          unzip -l build/AERA-Browser-*.aerap
+          sha256sum build/AERA-Browser-*.aerap | tee logs/aerap-sha256.txt
+          {
+            echo "### Browser plugin ${PLUGIN_VERSION}"
+            echo "- Turnip: Adreno 613 entries + AERA-DEBUG-CTOR"
+            echo "- Mesa EGL/Zink swapped: ${MESA_SWAPPED:-0}"
+            [ -f mesa-egl/BUILD_TAG ] && echo "- Mesa build variant: $(cat mesa-egl/BUILD_TAG)"
+            echo "- Package: AERA-Browser-${PLUGIN_VERSION}.aerap (unsigned)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aera-browser-plugin
+          path: |
+            browser-src/build/AERA-Browser-*.aerap
+            browser-src/build/runtime.xz
+            browser-src/build/plugin.json
+            browser-src/build/manifest.json
+            browser-src/build/aera_browser_payload.hpp
+            browser-src/logs
+          if-no-files-found: error
+
+      - name: Attach the .aerap to the recovery release (if it exists)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.run_id }}" \
+            browser-src/build/AERA-Browser-*.aerap --clobber --repo "$GITHUB_REPOSITORY"
+
+  summary:
+    if: ${{ always() }}
+    needs: [recovery, browser_build, browser_package]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Job results
+        run: |
+          {
+            echo "## AERA combined build"
+            echo
+            echo "| job | result |"
+            echo "|---|---|"
+            echo "| recovery | ${{ needs.recovery.result }} |"
+            echo "| browser_build (continue-on-error) | ${{ needs.browser_build.result }} |"
+            echo "| browser_package (continue-on-error) | ${{ needs.browser_package.result }} |"
+            echo
+            echo "Artifacts: recovery-build-logs, recovery-images, turnip, mesa-egl, browser-build-logs, aera-browser-plugin."
+            echo "For runner-level diagnostics re-run the workflow with 'Enable debug logging'."
+          } >> "$GITHUB_STEP_SUMMARY"
