@@ -4,8 +4,8 @@ name: Build AERA skysim2 + browser (maximum logging)
 #   recovery        -> AERA recovery for sky (patched, verbose browser env, probe, ...)
 #   browser_build   -> Turnip (Adreno 613) and an instrumented Mesa EGL/Zink/softpipe build
 #   browser_package -> overlay onto the published runtime, pack, unsigned .aerap
-# The browser jobs run AFTER recovery and are continue-on-error: they can never fail
-# the workflow, and they still run when recovery failed.
+# The browser jobs run IN PARALLEL with recovery (they do not depend on it) and are
+# continue-on-error: they can never fail the workflow, whatever recovery does.
 
 on:
   workflow_dispatch:
@@ -91,17 +91,18 @@ jobs:
 
     steps:
     - name: Cleanup
+      timeout-minutes: 15
       uses: rokibhasansagar/slimhub_actions@main
 
     - name: Prepare the build environment
       run: |
         sudo apt-get update
-        DEBIAN_FRONTEND=noninteractive sudo apt-get install -yq \
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq \
           git python3 tar aria2 ccache
-        DEBIAN_FRONTEND=noninteractive sudo apt-get install -yq \
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq \
           linux-modules-extra-$(uname -r) || \
           echo "linux-modules-extra-$(uname -r) unavailable; continuing without it"
-        curl -fL -O "https://gitlab.com/OrangeFox/misc/scripts/-/raw/master/setup/android_build_env.sh"
+        curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 --max-time 120 -O "https://gitlab.com/OrangeFox/misc/scripts/-/raw/master/setup/android_build_env.sh"
         sudo bash android_build_env.sh
 
     - name: Install OpenJDK
@@ -828,6 +829,7 @@ jobs:
         git diff > "$GITHUB_WORKSPACE/logs/devicetree-changes.diff" || true
 
     - name: Set swap space
+      timeout-minutes: 15
       uses: pierotofy/set-swap-space@master
       with:
         swap-size-gb: 30
@@ -943,11 +945,12 @@ jobs:
   #   2) browser_package: overlay onto the published runtime, pack, build the .aerap
   # ===========================================================================
   browser_build:
-    needs: recovery
     if: ${{ !cancelled() && inputs.build_browser && github.event.repository.owner.id == github.event.sender.id }}
     continue-on-error: true
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 240
+    outputs:
+      turnip: ${{ steps.turnip_upload.outcome }}
     env:
       MESA_VERSION: "26.2.2"
       # Redmi "sky" (ravelin): qcom,chipid = <0x06010300>, Adreno613v1 (gen6_3_26_0).
@@ -983,7 +986,7 @@ jobs:
       - name: Download Mesa and add Adreno 613 (Turnip tree)
         run: |
           cd browser-src
-          curl -fsSL "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" | tar -xJ
+          curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 20 --max-time 900 "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" | tar -xJ
           mv "mesa-${MESA_VERSION}" mesa-src
           cd mesa-src
           dev=src/freedreno/common/freedreno_devices.py
@@ -1107,6 +1110,7 @@ jobs:
           sha256sum "$lib" | tee logs/turnip-sha256.txt
 
       - name: Upload Turnip driver
+        id: turnip_upload
         uses: actions/upload-artifact@v4
         with:
           name: turnip
@@ -1263,7 +1267,7 @@ jobs:
           set -o pipefail
           cd browser-src
           mkdir -p logs
-          curl -fsSL "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" | tar -xJ
+          curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 20 --max-time 900 "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" | tar -xJ
           mv "mesa-${MESA_VERSION}" mesa-egl-pristine
           patch -d mesa-egl-pristine -p1 -i "$PWD/source/patches/mesa-${MESA_VERSION}-zink-kgsl-surfaceless"*.patch
           cat > build-egl-in-alpine.sh <<'SCRIPT'
@@ -1382,7 +1386,7 @@ jobs:
 
   browser_package:
     needs: browser_build
-    if: ${{ !cancelled() && needs.browser_build.result == 'success' }}
+    if: ${{ !cancelled() && needs.browser_build.outputs.turnip == 'success' }}
     continue-on-error: true
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -1435,7 +1439,7 @@ jobs:
           if [ -n "${STAGED_RUNTIME_URL:-}" ]; then
             auth=()
             [ -n "${STAGED_RUNTIME_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $STAGED_RUNTIME_TOKEN")
-            curl -fsSL "${auth[@]}" -o stage.tar "$STAGED_RUNTIME_URL"
+            curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 20 --max-time 1200 "${auth[@]}" -o stage.tar "$STAGED_RUNTIME_URL"
             # Symlinks (musl loader alias) must survive extraction; pack.py resolves them.
             tar --no-same-owner -xf stage.tar -C stage
             if [ "$(ls -A stage | wc -l)" = 1 ] && [ -d "stage/$(ls stage)" ]; then
@@ -1447,7 +1451,7 @@ jobs:
             url=$(python3 -c "import json;print(json.load(open('plugin.json'))['payload_url'])")
             want=$(python3 -c "import json;print(json.load(open('plugin.json'))['payload_sha256'])")
             echo "STAGED_RUNTIME_URL not set; using published runtime: $url"
-            curl -fsSL -o base-runtime.xz "$url"
+            curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 20 --max-time 1200 -o base-runtime.xz "$url"
             echo "$want  base-runtime.xz" | sha256sum -c -
             python3 - base-runtime.xz stage <<'PY'
           import os, struct, subprocess, sys
