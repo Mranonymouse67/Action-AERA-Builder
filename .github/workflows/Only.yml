@@ -1,12 +1,11 @@
-
-name: Build AERA browser plugin only (Turnip + Mesa EGL/Zink, Zink errors ungated)
+name: Build AERA browser plugin (Adreno 613 Turnip + Zink)
 
 # Browser-only build. No recovery image is built or needed.
-#   browser_build   -> Turnip (Adreno 613, AERA-DEBUG-CTOR, TU_DEBUG=startup,noconform)
-#                      + instrumented Mesa EGL/Zink/softpipe with Zink errors un-gated
+#   browser_build   -> Turnip with Adreno 613 support + VK 1.1 exposure patch,
+#                      and Mesa EGL/Zink (KGSL surfaceless patch), Zink only
 #   browser_package -> overlay onto the published runtime, pack, unsigned .aerap
-# Output: artifact "aera-browser-plugin" (the .aerap), plus turnip, mesa-egl and
-# browser-build-logs. Install the .aerap on the device; the installed recovery stays as is.
+# Output: artifact "aera-browser-plugin" containing only the .aerap. Install it on the device.
+# (The turnip / mesa-egl artifacts only pass files between the two jobs and expire after 1 day.)
 
 on:
   workflow_dispatch:
@@ -23,7 +22,7 @@ on:
 
 jobs:
   # ===========================================================================
-  #   1) browser_build  : Turnip (Adreno 613) + instrumented Mesa EGL/Zink/softpipe
+  #   1) browser_build  : Turnip (Adreno 613) + Mesa EGL/Zink
   #   2) browser_package: overlay onto the published runtime, pack, build the .aerap
   # ===========================================================================
   browser_build:
@@ -36,33 +35,10 @@ jobs:
       MESA_VERSION: "26.2.2"
       # Redmi "sky" (ravelin): qcom,chipid = <0x06010300>, Adreno613v1 (gen6_3_26_0).
       A613_CHIP_ID: "0x06010300"
-      ADD_SOFTPIPE: "1"
-      INSTRUMENT_MESA: "1"
     steps:
-      - name: Runner and tool versions
-        run: |
-          set -x
-          uname -a
-          nproc
-          free -h
-          df -h
-          docker --version
-          python3 --version
-
       - name: Fetch AERA browser plugin sources (AERA-Plugins/browser)
         run: |
           git clone --depth 1 https://github.com/AERA-Plugins/browser.git browser-src
-          cd browser-src
-          mkdir -p logs
-          git log -1 --format='%H %cd %s' | tee logs/browser-src-commit.txt
-          python3 -m json.tool plugin.json | head -30
-          ls -R source | head -60
-
-      - name: Shell + Python syntax (browser sources)
-        run: |
-          cd browser-src
-          for f in source/*.sh; do bash -n "$f"; done
-          python3 -m py_compile source/pack.py
 
       - name: Download Mesa and add Adreno 613 (Turnip tree)
         run: |
@@ -71,8 +47,6 @@ jobs:
           mv "mesa-${MESA_VERSION}" mesa-src
           cd mesa-src
           dev=src/freedreno/common/freedreno_devices.py
-          echo "--- existing 613 / 0x0601 entries in the upstream table (informational) ---"
-          grep -n -E '613|0x0601[0-9a-f]{4}' "$dev" || true
           python3 - "$dev" <<'PY'
           import os, re, sys
           p = sys.argv[1]
@@ -97,12 +71,9 @@ jobs:
           open(p, "w").write(s)
           print("inserted Adreno 613 entries")
           PY
-          grep -n -B3 -A6 'Adreno (TM) 613' "$dev"
 
-      # Env-var approach (TU_DEBUG=noconform) showed no effect in the device log
-      # (TU_DEBUG stayed 0x1), so force it in the source instead. Turnip hides
-      # VK 1.1+ extensions (incl. VK_KHR_maintenance5, which Zink requires) on GPUs
-      # without hw multiview; this makes the A613 count as multiview-capable.
+      # Turnip hides VK 1.1+ extensions (incl. VK_KHR_maintenance5, which Zink requires)
+      # on GPUs without hw multiview. Mark the A613 as multiview-capable so Zink starts.
       - name: Force VK 1.1 / maintenance5 on the A613 (Turnip source patch)
         run: |
           cd browser-src/mesa-src
@@ -118,44 +89,13 @@ jobs:
           open(p, "w").write(s)
           print("patched tu_has_multiview -> true")
           PY
-          grep -n -B2 -A2 "AERA: A613 forced multiview" src/freedreno/vulkan/tu_device.cc
 
-      # A constructor compiled into the Turnip library itself: raises Mesa's log
-      # level and prints a marker line, so recovery.log proves THIS driver ran.
-      - name: Add debug environment constructor to Turnip
-        run: |
-          cd browser-src
-          f=mesa-src/src/freedreno/vulkan/tu_util.cc
-          [ -f "$f" ] || f=mesa-src/src/freedreno/vulkan/tu_device.cc
-          [ -f "$f" ] || { echo "::error::no Turnip source file found for the debug constructor"; exit 1; }
-          cat >> "$f" <<'EOF4'
-
-          /* AERA debug: surface Zink/Mesa error messages in recovery.log */
-          #include <stdlib.h>
-          #include <stdio.h>
-          __attribute__((constructor, used)) static void aera_debug_env_ctor(void)
-          {
-             /* The marker is used by code, so the linker cannot drop it. */
-             setenv("AERA_DEBUG_ENV_CTOR", "1", 0);
-             setenv("MESA_LOG_LEVEL", "debug", 0);
-             /* overwrite=1: the recovery jail env already sets TU_DEBUG=startup, and
-             * overwrite=0 would leave it without noconform. */
-             setenv("TU_DEBUG", "startup,noconform", 1);
-             /* Visible proof in recovery.log that this exact driver build ran. */
-             fputs("AERA-DEBUG-CTOR: Turnip loaded, MESA_LOG_LEVEL set\n", stderr);
-             fprintf(stderr, "AERA-DEBUG-CTOR: TU_DEBUG=%s, multiview forced in source (v2)\n",
-                     getenv("TU_DEBUG") ? getenv("TU_DEBUG") : "(unset)");
-             fflush(stderr);
-          }
-          EOF4
-          tail -16 "$f"
-
-      - name: Build libvulkan_freedreno.so (Alpine / musl, verbose)
+      - name: Build libvulkan_freedreno.so (Alpine / musl)
         run: |
           set -o pipefail
           cd browser-src
           cat > build-in-alpine.sh <<'SCRIPT'
-          set -eux
+          set -eu
           apk add --no-cache \
             bash coreutils patch grep sed curl xz git \
             build-base linux-headers meson samurai pkgconf \
@@ -181,39 +121,25 @@ jobs:
           needs_exe_wrapper = false
           EOF2
 
-          # samu -v prints every compile command (full verbose build log)
-          printf '#!/bin/sh\nexec samu -v "$@"\n' > /usr/local/bin/samu-v
-          chmod +x /usr/local/bin/samu-v
-          export NINJA=/usr/local/bin/samu-v
+          export NINJA=samu
           export AERA_BROWSER_JOBS="$(nproc)"
-          mkdir -p /work/logs /work/out
-          bash source/build-turnip-a825.sh /work/mesa-src /work/mesa-build /tmp/cross.ini || {
-            cp /work/mesa-build/meson-logs/meson-log.txt /work/logs/turnip-meson-log.txt 2>/dev/null || true
-            exit 1
-          }
-          cp /work/mesa-build/meson-logs/meson-log.txt /work/logs/turnip-meson-log.txt || true
+          mkdir -p /work/out
+          bash source/build-turnip-a825.sh /work/mesa-src /work/mesa-build /tmp/cross.ini
           cp /work/mesa-build/src/freedreno/vulkan/libvulkan_freedreno.so /work/out/
           strip --strip-unneeded /work/out/libvulkan_freedreno.so
-          ls -l /work/out
           SCRIPT
-          docker run --rm -v "$PWD":/work -w /work alpine:3.22 sh build-in-alpine.sh 2>&1 | tee logs/turnip-build.log
+          docker run --rm -v "$PWD":/work -w /work alpine:3.22 sh build-in-alpine.sh
 
       - name: Verify the built Turnip driver
         run: |
           cd browser-src
           sudo apt-get install -y binutils >/dev/null
           lib=out/libvulkan_freedreno.so
-          strings "$lib" | grep -F 'Adreno (TM) 613' \
+          strings "$lib" | grep -qF 'Adreno (TM) 613' \
             || { echo "::error::Adreno (TM) 613 not present in built driver"; exit 1; }
           for n in 'Adreno (TM) 722' 'Adreno (TM) 825'; do
             strings "$lib" | grep -qF "$n" || { echo "::error::$n missing from built driver"; exit 1; }
           done
-          echo "OK: 613 / 722 / 825 present"
-          strings "$lib" | grep -qF 'AERA_DEBUG_ENV_CTOR' \
-            || { echo "::error::debug constructor missing from built driver"; exit 1; }
-          echo "OK: debug constructor present"
-          readelf -d "$lib" | grep -E 'NEEDED|SONAME'
-          sha256sum "$lib" | tee logs/turnip-sha256.txt
 
       - name: Upload Turnip driver
         id: turnip_upload
@@ -222,160 +148,24 @@ jobs:
           name: turnip
           path: browser-src/out/libvulkan_freedreno.so
           if-no-files-found: error
+          retention-days: 1
 
-      # ---- experimental: the runtime's EGL/Zink is a separate Mesa build. This
-      # rebuilds it from the repo recipe (EGL, GLES2, Zink, surfaceless, no LLVM)
-      # with (a) AERA-FAIL prints at every screen-creation failure exit and
-      # (b) softpipe so Mesa's software fallback has a driver. Tries instrumented
-      # first, then plain, with and without the 'surfaceless' platform option.
-      # A failure here is non-fatal: the package job just keeps the stock EGL/Zink.
-      - name: Write Mesa instrumentation script
-        run: |
-          cd browser-src
-          cat > instrument_mesa.py <<'PYEOF'
-          #!/usr/bin/env python3
-          """AERA: make Mesa's EGL / DRI frontend / Zink screen-creation paths say WHY they fail.
-
-          Every failure exit (goto fail/err/cleanup, and `return NULL/false/EGL_FALSE` inside the
-          screen-creation functions) gets a fprintf(stderr, "AERA-FAIL file:line in func()") in front
-          of it. Nothing is printed on the success path. Missing files/functions are skipped and
-          reported, never fatal.
-          """
-          import re
-          import sys
-          from pathlib import Path
-
-          root = Path(sys.argv[1])
-
-          # file -> set of function names whose `return NULL/false/EGL_FALSE` are instrumented
-          # (None = no function-scoped returns, gotos only)
-          TARGETS = {
-              "src/gallium/drivers/zink/zink_screen.c": {
-                  "zink_internal_create_screen", "zink_create_screen", "zink_drm_create_screen",
-                  "choose_pdev", "zink_create_logical_device", "create_logical_device",
-                  "zink_get_physical_device_info", "init_driver_workarounds", "zink_screen_init_compiler",
-                  "zink_get_display_device", "zink_init_screen_resource_functions",
-              },
-              "src/gallium/drivers/zink/zink_instance.c": {"zink_create_instance"},
-              "src/gallium/frontends/dri/dri_util.c": {
-                  "driCreateNewScreen3", "driCreateNewScreen2", "driCreateNewScreen",
-                  "driCreateNewScreen3_", "dri_create_new_screen",
-              },
-              "src/gallium/frontends/dri/dri_screen.c": {
-                  "dri_init_screen", "dri_create_new_screen", "dri_screen_init_cb",
-              },
-              "src/gallium/frontends/dri/drisw.c": {
-                  "drisw_init_screen", "drisw_create_new_screen", "dri_swrast_kms_init_screen",
-              },
-              "src/gallium/frontends/dri/kopper.c": {"kopper_init_screen", "kopper_create_new_screen"},
-              "src/gallium/frontends/dri/dri2.c": {"dri2_init_screen", "dri2_create_new_screen"},
-              "src/gallium/auxiliary/pipe-loader/pipe_loader_sw.c": {
-                  "pipe_loader_sw_probe_dri", "pipe_loader_sw_probe_init_common",
-                  "pipe_loader_sw_create_screen", "pipe_loader_sw_probe_kms",
-              },
-              "src/gallium/auxiliary/target-helpers/sw_helper.h": {
-                  "sw_screen_create_vk", "sw_screen_create_zink", "sw_screen_create_named",
-                  "sw_screen_create", "sw_screen_create_zink_",
-              },
-              "src/egl/drivers/dri2/egl_dri2.c": {
-                  "dri2_create_screen", "dri2_setup_screen", "dri2_load_driver_common",
-                  "dri2_load_driver", "dri2_load_driver_swrast", "dri2_load_driver_dri3",
-                  "dri2_get_driver_extensions", "dri2_initialize", "dri2_init_screen_extensions",
-              },
-              "src/egl/drivers/dri2/platform_surfaceless.c": None,   # small file: everything
-          }
-
-          GOTO = re.compile(r"\bgoto\s+((?:fail|err|error|cleanup|out_err|bail)\w*)\s*;")
-          RET = re.compile(r"\breturn\s+(NULL|false|EGL_FALSE)\s*;")
-          FUNC_NAME = re.compile(r"^(?:[A-Za-z_][\w \t\*]*?[ \t\*])?([A-Za-z_]\w*)\s*\(")
-
-
-          def note(name, label):
-              return ('{ fprintf(stderr, "AERA-FAIL %s:%d in %s() -> ' + label +
-                      '\\n", __FILE__, __LINE__, __func__); ')
-
-
-          def instrument(text, funcs, whole_file_returns):
-              out = []
-              lines = text.split("\n")
-              cur = None          # current function name while inside a body
-              pending = None      # name seen at col 0, waiting for the '{' line
-              depth_open = False
-              n_goto = n_ret = 0
-              for ln in lines:
-                  if not depth_open:
-                      m = FUNC_NAME.match(ln) if ln and not ln[0].isspace() and not ln.startswith(("#", "/", "*", "}")) else None
-                      if m and "=" not in ln.split("(")[0] and not ln.rstrip().endswith(";"):
-                          pending = m.group(1)
-                      if ln.strip() == "{" and not ln[0].isspace() and pending:
-                          cur = pending
-                          depth_open = True
-                          pending = None
-                      elif ln.startswith("{") and pending:
-                          cur = pending
-                          depth_open = True
-                          pending = None
-                  elif ln.startswith("}"):
-                      depth_open = False
-                      cur = None
-
-                  def goto_sub(mm):
-                      global_n[0] += 1
-                      return note(cur or "?", mm.group(1)) + "goto " + mm.group(1) + "; }"
-
-                  def ret_sub(mm):
-                      global_n[1] += 1
-                      return note(cur or "?", "return " + mm.group(1)) + "return " + mm.group(1) + "; }"
-
-                  global_n = [0, 0]
-                  new = ln
-                  if "AERA-FAIL" not in new:
-                      new = GOTO.sub(goto_sub, new)
-                      if whole_file_returns or (cur is not None and funcs and cur in funcs):
-                          new = RET.sub(ret_sub, new)
-                  n_goto += global_n[0]
-                  n_ret += global_n[1]
-                  out.append(new)
-              return "\n".join(out), n_goto, n_ret
-
-
-          total = 0
-          already = 0
-          for rel, funcs in TARGETS.items():
-              p = root / rel
-              if not p.is_file():
-                  print(f"skip (missing): {rel}")
-                  continue
-              s = p.read_text()
-              if "AERA-FAIL" in s:
-                  print(f"already instrumented: {rel}")
-                  already += 1
-                  continue
-              new, g, r = instrument(s, funcs or set(), funcs is None)
-              if g + r:
-                  new = "#include <stdio.h>\n" + new
-                  p.write_text(new)
-              print(f"instrumented {rel}: {g} goto, {r} return")
-              total += g + r
-          print(f"total failure exits instrumented: {total}")
-          if total == 0 and already == 0:
-              sys.exit("nothing instrumented - Mesa source layout differs from what this script expects")
-          PYEOF
-          python3 -m py_compile instrument_mesa.py
-
-      - name: Build Mesa EGL + Zink (+ softpipe, instrumented) [experimental]
+      # The runtime's EGL/Zink is a separate Mesa build. This rebuilds it from the repo
+      # recipe (EGL, GLES2, Zink, surfaceless, no LLVM) with the KGSL surfaceless patch,
+      # (Zink only, no software renderer). Non-fatal: if it fails
+      # the package job keeps the runtime's stock EGL/Zink.
+      - name: Build Mesa EGL + Zink
         id: mesa_egl
         continue-on-error: true
         timeout-minutes: 150
         run: |
           set -o pipefail
           cd browser-src
-          mkdir -p logs
           curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 20 --max-time 900 "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" | tar -xJ
           mv "mesa-${MESA_VERSION}" mesa-egl-pristine
           patch -d mesa-egl-pristine -p1 -i "$PWD/source/patches/mesa-${MESA_VERSION}-zink-kgsl-surfaceless"*.patch
           cat > build-egl-in-alpine.sh <<'SCRIPT'
-          set -eux
+          set -eu
           apk add --no-cache \
             bash coreutils patch grep sed curl xz git \
             build-base linux-headers meson samurai pkgconf \
@@ -402,64 +192,36 @@ jobs:
           EOF2
 
           GALLIUM=zink
-          [ "$ADD_SOFTPIPE" = 1 ] && GALLIUM=zink,softpipe
-          mkdir -p /work/logs
-
           try_build() {
-            inst=$1
-            plat=$2
-            tag="instrument${inst}-platforms_${plat:-none}-gallium_${GALLIUM}"
+            plat=$1
+            tag="platforms_${plat:-none}-gallium_${GALLIUM}"
             echo "=============== attempt: $tag ==============="
             rm -rf /work/mesa-egl /work/mesa-egl-build /work/egl-install
             cp -a /work/mesa-egl-pristine /work/mesa-egl || return 1
-            if [ "$inst" = 1 ]; then
-              # AERA: make Zink say WHY screen creation fails. Upstream gates nearly every
-              # error behind !driver_name_is_inferred (true for the implicit surfaceless
-              # fallback) and a few use debug_printf (compiled out of release builds).
-              # Replacements stay on the same line, so line numbers do not shift.
-              zd=/work/mesa-egl/src/gallium/drivers/zink
-              sed -i 's/!screen->driver_name_is_inferred/true/g; s/!config->driver_name_is_inferred/true/g' \
-                "$zd"/*.c "$zd"/*.h "$zd"/*.py 2>/dev/null || true
-              for f in $(grep -l mesa_loge "$zd"/*.c "$zd"/*.h "$zd"/*.py 2>/dev/null); do
-                sed -i 's/debug_printf("ZINK:/mesa_loge("ZINK:/g' "$f"
-              done
-              echo "ungated driver_name_is_inferred checks left: $(grep -c 'driver_name_is_inferred' "$zd"/zink_screen.c)"
-              python3 /work/instrument_mesa.py /work/mesa-egl || return 1
-              # Save the patched + instrumented source around the failing goto so the log
-              # line numbers (patched line + 1) can be matched to real code.
-              sed -n '3480,3580p' "$zd/zink_screen.c" > "/work/logs/zink_screen_3480-3580_$tag.txt" 2>/dev/null || true
-              grep -n "AERA-FAIL" "$zd/zink_screen.c" | cut -c1-120 > "/work/logs/zink_screen_failsites_$tag.txt" 2>/dev/null || true
-            fi
             meson setup /work/mesa-egl-build /work/mesa-egl \
               --cross-file /tmp/cross.ini \
               -Dprefix=/usr -Dlibdir=lib -Dbuildtype=release \
               -Dgallium-drivers=$GALLIUM -Dvulkan-drivers= -Dplatforms=$plat \
               -Degl=enabled -Dgles1=disabled -Dgles2=enabled -Dopengl=false \
               -Dglx=disabled -Dgbm=disabled -Dllvm=disabled -Dvideo-codecs= \
-              -Dbuild-tests=false -Dglvnd=disabled || {
-                cp /work/mesa-egl-build/meson-logs/meson-log.txt "/work/logs/mesa-egl-meson-fail-$tag.txt" 2>/dev/null
-                return 1
-              }
-            samu -v -C /work/mesa-egl-build || return 1
+              -Dbuild-tests=false -Dglvnd=disabled || return 1
+            samu -C /work/mesa-egl-build || return 1
             DESTDIR=/work/egl-install meson install -C /work/mesa-egl-build --no-rebuild || return 1
             find /work/egl-install -name '*.so*' -exec strip --strip-unneeded {} + 2>/dev/null
-            cp /work/mesa-egl-build/meson-logs/meson-log.txt "/work/logs/mesa-egl-meson-ok-$tag.txt" 2>/dev/null
             echo "$tag" > /work/egl-install/BUILD_TAG
             return 0
           }
 
-          for inst in $( [ "$INSTRUMENT_MESA" = 1 ] && echo "1 0" || echo "0" ); do
-            for plat in surfaceless ""; do
-              if try_build "$inst" "$plat"; then
-                echo "SUCCESS: $(cat /work/egl-install/BUILD_TAG)"
-                exit 0
-              fi
-            done
+          for plat in surfaceless ""; do
+            if try_build "$plat"; then
+              echo "SUCCESS: $(cat /work/egl-install/BUILD_TAG)"
+              exit 0
+            fi
           done
           echo "all Mesa EGL/Zink build variants failed"
           exit 1
           SCRIPT
-          docker run --rm -e ADD_SOFTPIPE -e INSTRUMENT_MESA -v "$PWD":/work -w /work alpine:3.22 sh build-egl-in-alpine.sh 2>&1 | tee logs/mesa-egl-build.log
+          docker run --rm -v "$PWD":/work -w /work alpine:3.22 sh build-egl-in-alpine.sh
 
       - name: Collect Mesa EGL/Zink output
         if: ${{ steps.mesa_egl.outcome == 'success' }}
@@ -467,24 +229,16 @@ jobs:
         run: |
           cd browser-src
           sudo chown -R "$(id -u):$(id -g)" egl-install
-          cat egl-install/BUILD_TAG | tee logs/mesa-egl-build-tag.txt
           lib=egl-install/usr/lib
-          find egl-install -type f -o -type l | sort | head -80
           mkdir -p egl-out
           cp -L "$lib"/libEGL.so.1 egl-out/libEGL.so.1
           cp -L "$lib"/libGLESv2.so.2 egl-out/libGLESv2.so.2
           cp -L "$lib"/libgallium-*.so egl-out/libgallium.so
           : > egl-out/dri-names.txt
-          for n in zink swrast kms_swrast; do
+          for n in zink; do
             [ -e "$lib/dri/${n}_dri.so" ] && echo "$n" >> egl-out/dri-names.txt
           done
-          cat egl-out/dri-names.txt
           cp egl-install/BUILD_TAG egl-out/BUILD_TAG
-          for f in egl-out/*.so*; do
-            echo "== $f"; readelf -d "$f" | grep -E 'NEEDED|SONAME'; ls -l "$f"
-          done
-          echo "AERA-FAIL markers in libgallium: $(strings egl-out/libgallium.so | grep -c 'AERA-FAIL' || true)"
-          sha256sum egl-out/* | tee logs/mesa-egl-sha256.txt
 
       - name: Upload Mesa EGL/Zink output
         if: ${{ steps.mesa_egl.outcome == 'success' }}
@@ -494,14 +248,7 @@ jobs:
           name: mesa-egl
           path: browser-src/egl-out
           if-no-files-found: error
-
-      - name: Upload browser build logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: browser-build-logs
-          path: browser-src/logs
-          if-no-files-found: ignore
+          retention-days: 1
 
   browser_package:
     needs: browser_build
@@ -517,7 +264,6 @@ jobs:
       - name: Fetch AERA browser plugin sources (AERA-Plugins/browser)
         run: |
           git clone --depth 1 https://github.com/AERA-Plugins/browser.git browser-src
-          mkdir -p browser-src/logs
 
       - name: Resolve plugin version (must differ from plugin.json)
         run: |
@@ -619,13 +365,11 @@ jobs:
             install -m 0755 turnip/libvulkan_freedreno.so "$h"
             strings "$h" | grep -qF 'Adreno (TM) 613' \
               || { echo "::error::$h lacks Adreno 613 after replace"; exit 1; }
-            strings "$h" | grep -qF 'AERA-DEBUG-CTOR' \
-              || { echo "::error::$h lacks the debug constructor after replace"; exit 1; }
           done
 
       # Non-fatal. Swaps the runtime's EGL/GLES/Zink libraries for the rebuilt ones
       # only when every dependency is already present in the runtime.
-      - name: Swap in rebuilt Mesa EGL/Zink (+softpipe) if available
+      - name: Swap in rebuilt Mesa EGL/Zink if available
         continue-on-error: true
         run: |
           cd browser-src
@@ -633,7 +377,6 @@ jobs:
             echo "No rebuilt Mesa EGL/Zink artifact; keeping the runtime's own EGL/Zink."
             exit 0
           fi
-          cat mesa-egl/BUILD_TAG
           zd=$(find stage -name zink_dri.so -type f | head -1)
           [ -n "$zd" ] || { echo "::warning::zink_dri.so not found in runtime; skipping Mesa swap"; exit 0; }
           libdir=$(dirname "$(dirname "$zd")")
@@ -658,13 +401,7 @@ jobs:
           install -m 0755 mesa-egl/libgallium.so "$zd"
           install -m 0755 mesa-egl/libEGL.so.1 "$libdir/libEGL.so.1"
           install -m 0755 mesa-egl/libGLESv2.so.2 "$libdir/libGLESv2.so.2"
-          if grep -qx swrast mesa-egl/dri-names.txt; then
-            ln -sf zink_dri.so "$(dirname "$zd")/swrast_dri.so"
-            ln -sf zink_dri.so "$(dirname "$zd")/kms_swrast_dri.so"
-            echo "added software (softpipe) DRI driver aliases"
-          fi
           echo "MESA_SWAPPED=1" >> "$GITHUB_ENV"
-          ls -l "$(dirname "$zd")" "$libdir/libEGL.so.1" "$libdir/libGLESv2.so.2"
 
       - name: Pack runtime.xz
         run: cd browser-src && python3 source/pack.py stage build
@@ -691,7 +428,6 @@ jobs:
           json.dump(p, open("build/plugin.json","w"), indent=2, ensure_ascii=False)
           open("build/plugin.json","a").write("\n")
           PY
-          head -20 build/plugin.json
 
       # Unsigned: installable from the recovery Files app after a security warning.
       - name: Build unofficial .aerap package
@@ -702,12 +438,9 @@ jobs:
             --manifest build/plugin.json \
             --payload build/runtime.xz \
             --output "build/AERA-Browser-${PLUGIN_VERSION}.aerap"
-          ls -l build/*.aerap
-          unzip -l build/AERA-Browser-*.aerap
-          sha256sum build/AERA-Browser-*.aerap | tee logs/aerap-sha256.txt
           {
             echo "### Browser plugin ${PLUGIN_VERSION}"
-            echo "- Turnip: Adreno 613 entries + AERA-DEBUG-CTOR"
+            echo "- Turnip: Adreno 613 + multiview patch"
             echo "- Mesa EGL/Zink swapped: ${MESA_SWAPPED:-0}"
             [ -f mesa-egl/BUILD_TAG ] && echo "- Mesa build variant: $(cat mesa-egl/BUILD_TAG)"
             echo "- Package: AERA-Browser-${PLUGIN_VERSION}.aerap (unsigned)"
@@ -716,13 +449,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: aera-browser-plugin
-          path: |
-            browser-src/build/AERA-Browser-*.aerap
-            browser-src/build/runtime.xz
-            browser-src/build/plugin.json
-            browser-src/build/manifest.json
-            browser-src/build/aera_browser_payload.hpp
-            browser-src/logs
+          path: browser-src/build/AERA-Browser-*.aerap
           if-no-files-found: error
 
   summary:
@@ -740,6 +467,5 @@ jobs:
             echo "| browser_build | ${{ needs.browser_build.result }} |"
             echo "| browser_package | ${{ needs.browser_package.result }} |"
             echo
-            echo "Artifacts: turnip, mesa-egl, browser-build-logs, aera-browser-plugin."
-            echo "For runner-level diagnostics re-run the workflow with 'Enable debug logging'."
+            echo "Artifact: aera-browser-plugin."
           } >> "$GITHUB_STEP_SUMMARY"
