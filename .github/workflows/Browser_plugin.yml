@@ -5,6 +5,7 @@ name: Build AERA browser plugin (Adreno 613 Turnip + Zink)
 #                      and Mesa EGL/Zink (KGSL surfaceless patch), Zink only
 #   browser_package -> overlay onto the published runtime, pack, unsigned .aerap
 # Output: artifact "aera-browser-plugin" containing only the .aerap. Install it on the device.
+# The same .aerap is also attached to a prerelease tagged v<plugin version>.
 # (The turnip / mesa-egl artifacts only pass files between the two jobs and expire after 1 day.)
 
 on:
@@ -151,9 +152,9 @@ jobs:
           retention-days: 1
 
       # The runtime's EGL/Zink is a separate Mesa build. This rebuilds it from the repo
-      # recipe (EGL, GLES2, Zink, surfaceless, no LLVM) with the KGSL surfaceless patch,
-      # (Zink only, no software renderer). Non-fatal: if it fails
-      # the package job keeps the runtime's stock EGL/Zink.
+      # recipe (EGL, GLES2, Zink only, surfaceless, no LLVM, no software renderer) with
+      # the KGSL surfaceless patch. Non-fatal: if it fails, the package job keeps the
+      # runtime's stock EGL/Zink.
       - name: Build Mesa EGL + Zink
         id: mesa_egl
         continue-on-error: true
@@ -256,8 +257,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
-      contents: read
+      contents: write
     env:
+      MESA_VERSION: "26.2.2"
       STAGED_RUNTIME_URL: ${{ inputs.staged_runtime_url || vars.STAGED_RUNTIME_URL }}
       STAGED_RUNTIME_TOKEN: ${{ secrets.STAGED_RUNTIME_TOKEN }}
     steps:
@@ -455,8 +457,17 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v3
         with:
-          files: |
-           browser-src/build/AERA-Browser-*.aerap        
+          files: browser-src/build/AERA-Browser-*.aerap
+          fail_on_unmatched_files: true
+          tag_name: v${{ env.PLUGIN_VERSION }}
+          name: AERA Browser ${{ env.PLUGIN_VERSION }}
+          prerelease: true
+          body: |
+            AERA browser plugin ${{ env.PLUGIN_VERSION }} (unsigned .aerap)
+            Adreno 613 Turnip + Zink, Mesa ${{ env.MESA_VERSION }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   summary:
     if: ${{ always() }}
     needs: [browser_build, browser_package]
