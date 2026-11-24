@@ -1,5 +1,5 @@
 # credits azzy
-name: Build AERA skysim2 + browser (maximum logging)
+name: Build AERA skysim2 + browser (maximum logging, Zink errors ungated)
 
 # One workflow, two products:
 #   recovery        -> AERA recovery for sky (patched, verbose browser env, probe, ...)
@@ -1266,7 +1266,22 @@ jobs:
             rm -rf /work/mesa-egl /work/mesa-egl-build /work/egl-install
             cp -a /work/mesa-egl-pristine /work/mesa-egl || return 1
             if [ "$inst" = 1 ]; then
+              # AERA: make Zink say WHY screen creation fails. Upstream gates nearly every
+              # error behind !driver_name_is_inferred (true for the implicit surfaceless
+              # fallback) and a few use debug_printf (compiled out of release builds).
+              # Replacements stay on the same line, so line numbers do not shift.
+              zd=/work/mesa-egl/src/gallium/drivers/zink
+              sed -i 's/!screen->driver_name_is_inferred/true/g; s/!config->driver_name_is_inferred/true/g' \
+                "$zd"/*.c "$zd"/*.h "$zd"/*.py 2>/dev/null || true
+              for f in $(grep -l mesa_loge "$zd"/*.c "$zd"/*.h "$zd"/*.py 2>/dev/null); do
+                sed -i 's/debug_printf("ZINK:/mesa_loge("ZINK:/g' "$f"
+              done
+              echo "ungated driver_name_is_inferred checks left: $(grep -c 'driver_name_is_inferred' "$zd"/zink_screen.c)"
               python3 /work/instrument_mesa.py /work/mesa-egl || return 1
+              # Save the patched + instrumented source around the failing goto so the log
+              # line numbers (patched line + 1) can be matched to real code.
+              sed -n '3480,3580p' "$zd/zink_screen.c" > "/work/logs/zink_screen_3480-3580_$tag.txt" 2>/dev/null || true
+              grep -n "AERA-FAIL" "$zd/zink_screen.c" | cut -c1-120 > "/work/logs/zink_screen_failsites_$tag.txt" 2>/dev/null || true
             fi
             meson setup /work/mesa-egl-build /work/mesa-egl \
               --cross-file /tmp/cross.ini \
