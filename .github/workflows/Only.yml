@@ -99,6 +99,27 @@ jobs:
           PY
           grep -n -B3 -A6 'Adreno (TM) 613' "$dev"
 
+      # Env-var approach (TU_DEBUG=noconform) showed no effect in the device log
+      # (TU_DEBUG stayed 0x1), so force it in the source instead. Turnip hides
+      # VK 1.1+ extensions (incl. VK_KHR_maintenance5, which Zink requires) on GPUs
+      # without hw multiview; this makes the A613 count as multiview-capable.
+      - name: Force VK 1.1 / maintenance5 on the A613 (Turnip source patch)
+        run: |
+          cd browser-src/mesa-src
+          python3 - <<'PY'
+          import re, sys
+          p = "src/freedreno/vulkan/tu_device.cc"
+          s = open(p).read()
+          pat = re.compile(r'return\s+device->info->props\.has_hw_multiview\s*\|\|\s*TU_DEBUG\(NOCONFORM\);')
+          if len(pat.findall(s)) != 1:
+              print("::error::tu_has_multiview anchor not found exactly once in " + p)
+              sys.exit(1)
+          s = pat.sub("return true; /* AERA: A613 forced multiview so Turnip exposes VK 1.1+ and VK_KHR_maintenance5 */", s)
+          open(p, "w").write(s)
+          print("patched tu_has_multiview -> true")
+          PY
+          grep -n -B2 -A2 "AERA: A613 forced multiview" src/freedreno/vulkan/tu_device.cc
+
       # A constructor compiled into the Turnip library itself: raises Mesa's log
       # level and prints a marker line, so recovery.log proves THIS driver ran.
       - name: Add debug environment constructor to Turnip
@@ -122,6 +143,8 @@ jobs:
              setenv("TU_DEBUG", "startup,noconform", 1);
              /* Visible proof in recovery.log that this exact driver build ran. */
              fputs("AERA-DEBUG-CTOR: Turnip loaded, MESA_LOG_LEVEL set\n", stderr);
+             fprintf(stderr, "AERA-DEBUG-CTOR: TU_DEBUG=%s, multiview forced in source (v2)\n",
+                     getenv("TU_DEBUG") ? getenv("TU_DEBUG") : "(unset)");
              fflush(stderr);
           }
           EOF4
