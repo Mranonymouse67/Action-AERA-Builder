@@ -452,6 +452,11 @@ jobs:
           path: browser-src/build/AERA-Browser-*.aerap
           if-no-files-found: error
 
+      - name: Upload to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+           browser-src/build/AERA-Browser-*.aerap        
   summary:
     if: ${{ always() }}
     needs: [browser_build, browser_package]
