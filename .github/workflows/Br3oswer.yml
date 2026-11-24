@@ -158,7 +158,7 @@ jobs:
             ("LIBGL_DEBUG", "verbose"),        # Mesa loader: driver/DRI screen messages
             ("MESA_DEBUG", "1"),               # Mesa core diagnostics
             ("MESA_LOG_LEVEL", "debug"),       # Mesa log filter: shows Zink's own error messages
-            ("TU_DEBUG", "startup"),           # Turnip: device probe, unsupported-GPU reasons
+            ("TU_DEBUG", "startup,noconform"),  # Turnip: startup log; noconform exposes VK 1.1+ (multiview gate) so Zink gets VK_KHR_maintenance5
             ("VK_LOADER_DEBUG", "all"),        # Vulkan loader: ICD search, dlopen errors
             ("G_MESSAGES_DEBUG", "all"),       # GLib/WPE: surfaceless display errors
         ]
@@ -995,7 +995,7 @@ jobs:
              /* The marker is used by code, so the linker cannot drop it. */
              setenv("AERA_DEBUG_ENV_CTOR", "1", 0);
              setenv("MESA_LOG_LEVEL", "debug", 0);
-             setenv("TU_DEBUG", "startup", 0);
+             setenv("TU_DEBUG", "startup,noconform", 0);
              /* Visible proof in recovery.log that this exact driver build ran. */
              fputs("AERA-DEBUG-CTOR: Turnip loaded, MESA_LOG_LEVEL set\n", stderr);
              fflush(stderr);
