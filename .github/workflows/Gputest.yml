@@ -1,0 +1,465 @@
+name: Build AERA recovery GPu1
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_tree_url:
+        description: "Device tree repository"
+        required: true
+        default: https://github.com/Adithy4n/recovery_device_xiaomi_sky.git
+        type: string
+
+      device_tree_branch:
+        description: "Device tree branch"
+        required: true
+        default: Abort
+        type: string
+
+      nuke_volume_keys:
+        description: "Disable the hardware volume keys (no overlay, no audio volume file updates)"
+        required: false
+        default: true
+        type: boolean
+
+      nvt_blank_fix:
+        description: "Skip the blank/wake cycle at recovery start on NVT panels (m19_36); FTS panels (m19_42) keep it"
+        required: false
+        default: true
+        type: boolean
+
+      fps_timing:
+        description: "Add frame timing log to GpuRenderer::Present (logcat: 'frame period')"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  recovery:
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    env:
+      SYNC_URL: https://github.com/AERA-Recovery/android_manifest.git
+      MANIFEST_BRANCH: "aera-16.0"
+      SRC_DIR: aera
+      DEVICE_TREE_URL: ${{ inputs.device_tree_url }}
+      DEVICE_TREE_BRANCH: ${{ inputs.device_tree_branch }}
+      DEVICE_TREE_WEB: https://github.com/Adithy4n/recovery_device_xiaomi_sky
+      DEVICE_PATH: device/xiaomi/sky
+      DEVICE_NAME: sky
+      MAKEFILE_NAME: twrp_sky-bp2a-eng
+      BUILD_TARGET: recovery
+      TZ: Asia/Kolkata
+      USE_CCACHE: "1"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 4G
+      CCACHE_COMPILERCHECK: content
+
+    steps:
+    - name: Cleanup
+      timeout-minutes: 15
+      uses: rokibhasansagar/slimhub_actions@main
+
+    - name: Prepare the build environment
+      run: |
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq \
+          git python3 tar aria2 ccache
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq \
+          linux-modules-extra-$(uname -r) || \
+          echo "linux-modules-extra-$(uname -r) unavailable; continuing without it"
+        curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 --max-time 120 -O "https://gitlab.com/OrangeFox/misc/scripts/-/raw/master/setup/android_build_env.sh"
+        sudo bash android_build_env.sh
+
+    - name: Restore compiler cache
+      id: ccache_restore
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: ${{ env.MANIFEST_BRANCH }}-sky-ccache
+      continue-on-error: true
+
+    - name: Install OpenJDK
+      uses: actions/setup-java@v6
+      with:
+        distribution: 'zulu'
+        java-version: '17'
+
+    - name: Sync AERA sources
+      run: |
+        mkdir -p "$GITHUB_WORKSPACE/${{ env.SRC_DIR }}"
+        cd "$GITHUB_WORKSPACE/${{ env.SRC_DIR }}"
+        repo init --depth=1 -u ${{ env.SYNC_URL }} -b ${{ env.MANIFEST_BRANCH }}
+        repo sync -c --force-sync --no-clone-bundle --no-tags -j$(nproc)
+
+    - name: AERA - disable volume keys (no audio on this device)
+      if: ${{ inputs.nuke_volume_keys }}
+      run: |
+        # runner.cpp AdjustVolume() is what the volume keys call: it writes
+        # /tmp/aera-audio-volume and shows the volume overlay. Replace its body
+        # with a no-op. The Power+Volume Down screenshot chord and the startup
+        # Volume Down check are handled elsewhere and keep working.
+        python3 - <<'PY'
+        import re, sys
+        from pathlib import Path
+
+        f = Path("${{ env.SRC_DIR }}/bootable/recovery/aeraui/core/runner.cpp")
+        s = f.read_text()
+        MARK = "AERA_NO_VOLUME_KEYS_PATCH"
+        if MARK in s:
+            sys.exit(0)
+
+        def fail(msg):
+            print("lines mentioning volume in", f)
+            for i, l in enumerate(s.split("\n"), 1):
+                if "AdjustVolume" in l or "WriteVolume" in l or "ShowVolume" in l:
+                    print(f"  {i}: {l}")
+            sys.exit("::error::" + msg)
+
+        pat = re.compile(
+            r'void AdjustVolume\([^)]*\)\s*\{.*?\n\}\n', re.S)
+        if len(pat.findall(s)) != 1:
+            fail("AdjustVolume() not found exactly once, update the patch")
+
+        stub = ("// " + MARK + ": audio unsupported, volume keys are ignored.\n"
+                "void AdjustVolume(Engine&, InteractionBoost&, HardwareState&, int) {}\n")
+        s = pat.sub(lambda m: stub, s, count=1)
+
+        # WriteVolume must stay referenced or -Werror=unused-function trips.
+        if s.count("WriteVolume(") < 2:
+            fail("WriteVolume() is no longer called anywhere; keep one call")
+        f.write_text(s)
+        print("patched", f)
+        PY
+        grep -n -B1 -A2 "AERA_NO_VOLUME_KEYS_PATCH" "${{ env.SRC_DIR }}/bootable/recovery/aeraui/core/runner.cpp"
+
+    - name: AERA - blank screen on boot only for non-NVT panels
+      if: ${{ inputs.nvt_blank_fix }}
+      run: |
+        # TW_SCREEN_BLANK_ON_BOOT (aeraui/platform/aera_ui_host.cpp, gui_init)
+        # blanks and wakes the panel at recovery start. FTS panels (m19_42_*)
+        # need that, but on NVT panels (m19_36_*) it collides with the
+        # touch-FW load and breaks the display. Keep the flag true in
+        # BoardConfig; skip the cycle at runtime when an NVT panel is found:
+        #   1) /proc/cmdline msm_drm.dsi_display0=...m19_36 / m19_42...
+        #   2) fallback: /proc/NVTSPI or /proc/nvt_fw_version exists
+        python3 - <<'PY'
+        import re, sys
+        from pathlib import Path
+
+        f = Path("${{ env.SRC_DIR }}/bootable/recovery/aeraui/platform/aera_ui_host.cpp")
+        s = f.read_text()
+        if "AERA_NVT_BLANK_ON_BOOT_PATCH" in s:
+            sys.exit(0)
+
+        def fail(msg):
+            print("lines mentioning blank / the flag in", f)
+            for i, l in enumerate(s.split("\n"), 1):
+                if "BLANK_ON_BOOT" in l or "Blank(" in l or "Wake(" in l:
+                    print(f"  {i}: {l}")
+            sys.exit("::error::" + msg)
+
+        helper = '''/* AERA_NVT_BLANK_ON_BOOT_PATCH */
+        static bool aera_panel_is_nvt() {
+          char b[4096] = {0};
+          std::ifstream f("/proc/cmdline");
+          if (f) {
+            f.read(b, sizeof(b) - 1);
+            b[f.gcount()] = 0;
+            if (std::strstr(b, "m19_36") || std::strstr(b, "n19_36")) return true;
+            if (std::strstr(b, "m19_42") || std::strstr(b, "n19_42")) return false;
+          }
+          return access("/proc/NVTSPI", F_OK) == 0 ||
+                 access("/proc/nvt_fw_version", F_OK) == 0;
+        }
+
+        '''
+
+        # 1) unistd.h for access()
+        inc = "#include <iterator>\n"
+        if s.count(inc) != 1:
+            fail("#include <iterator> anchor not found exactly once")
+        s = s.replace(inc, inc + "#include <unistd.h>\n", 1)
+
+        # 2) helper right before gui_init
+        anchor = 'extern "C" int gui_init() {'
+        if s.count(anchor) != 1:
+            fail("gui_init anchor not found exactly once")
+        s = s.replace(anchor, helper + anchor, 1)
+
+        # 3) wrap the blank/wake cycle
+        pat = re.compile(
+            r'(#ifdef TW_SCREEN_BLANK_ON_BOOT[ \t]*\n)'
+            r'([ \t]*aeraScreenTimer\.Blank\(\);[ \t]*\n)'
+            r'([ \t]*aeraScreenTimer\.Wake\(\);[ \t]*\n)'
+            r'(#endif)')
+        m = pat.search(s)
+        if not m:
+            fail("TW_SCREEN_BLANK_ON_BOOT block in gui_init differs, update the patch")
+        new = (m.group(1) +
+               "  if (aera_panel_is_nvt()) {\n"
+               '    gui_print("I:NVT panel detected, skipping blank-on-boot.\\n");\n'
+               "  } else {\n"
+               "    aeraScreenTimer.Blank();\n"
+               "    aeraScreenTimer.Wake();\n"
+               "  }\n" + m.group(4))
+        s = s[:m.start()] + new + s[m.end():]
+        f.write_text(s)
+        print("patched", f)
+        PY
+
+    - name: AERA - frame timing log in GpuRenderer::Present
+      if: ${{ inputs.fps_timing }}
+      run: |
+        # Logs every 120 frames to logcat:
+        #   frame period X ms (Y fps) | glFinish A ms | drm_present B ms
+        # Patch paths are relative to bootable/recovery (aeraui/core/gpu_renderer.cpp).
+        set -e
+        cd "${{ env.SRC_DIR }}/bootable/recovery"
+        F=aeraui/core/gpu_renderer.cpp
+        if grep -q "AERA-TIMING" "$F"; then
+          echo "timing patch already applied"
+          exit 0
+        fi
+        cat > /tmp/gpu_renderer_timing.patch <<'PATCH_EOF'
+        --- a/aeraui/core/gpu_renderer.cpp
+        +++ b/aeraui/core/gpu_renderer.cpp
+        @@ -11,6 +11,7 @@
+         #include <dlfcn.h>
+         #include <unistd.h>
+         
+        +#include <chrono>
+         #include <cstring>
+         
+         #include "drivers/opengles/glad/include/glad/egl.h"
+        @@ -419,7 +420,14 @@
+           // The native scanout and LVGL texture share the panel's portrait orientation.
+           // No additional axis mirroring is required for the final composition.
+           lv_opengles_render_display_texture(display, false, false);
+        +  // AERA-TIMING: measure GPU wait, DRM present and the real frame period.
+        +  using TimingClock = std::chrono::steady_clock;
+        +  static TimingClock::time_point timing_last_present{};
+        +  static double timing_finish_ms = 0, timing_drm_ms = 0, timing_period_ms = 0;
+        +  static unsigned timing_frames = 0, timing_periods = 0;
+        +  const auto timing_t0 = TimingClock::now();
+           glFinish();
+        +  const auto timing_t1 = TimingClock::now();
+           const GLenum present_error = glGetError();
+           if (present_error != GL_NO_ERROR) {
+             static unsigned int failures = 0;
+        @@ -428,7 +436,27 @@
+                                   "scanout composition error: %#x", present_error);
+             return false;
+           }
+        -  if (gr_drm_present(scanouts_[index]) != 0)
+        +  const bool drm_ok = gr_drm_present(scanouts_[index]) == 0;
+        +  const auto timing_t2 = TimingClock::now();
+        +  if (timing_last_present.time_since_epoch().count() != 0) {
+        +    timing_period_ms +=
+        +        std::chrono::duration<double, std::milli>(timing_t2 - timing_last_present).count();
+        +    ++timing_periods;
+        +  }
+        +  timing_last_present = timing_t2;
+        +  timing_finish_ms += std::chrono::duration<double, std::milli>(timing_t1 - timing_t0).count();
+        +  timing_drm_ms += std::chrono::duration<double, std::milli>(timing_t2 - timing_t1).count();
+        +  if (++timing_frames == 120) {
+        +    const double period = timing_periods ? timing_period_ms / timing_periods : 0.0;
+        +    __android_log_print(ANDROID_LOG_INFO, kLogTag,
+        +                        "frame period %.2f ms (%.1f fps) | glFinish %.2f ms | "
+        +                        "drm_present %.2f ms",
+        +                        period, period > 0.0 ? 1000.0 / period : 0.0,
+        +                        timing_finish_ms / timing_frames, timing_drm_ms / timing_frames);
+        +    timing_finish_ms = timing_drm_ms = timing_period_ms = 0;
+        +    timing_frames = timing_periods = 0;
+        +  }
+        +  if (!drm_ok)
+             return false;
+         
+           next_buffer_ = 1U - index;
+        PATCH_EOF
+        if ! patch -p1 --dry-run < /tmp/gpu_renderer_timing.patch; then
+          echo "::error::gpu_renderer timing patch does not apply; gpu_renderer.cpp changed upstream, regenerate the patch"
+          exit 1
+        fi
+        patch -p1 < /tmp/gpu_renderer_timing.patch
+        grep -n "AERA-TIMING" "$F"
+
+    - name: Get bootable/recovery commit
+      id: recovery_commit
+      run: |
+        cd "${{ env.SRC_DIR }}/bootable/recovery"
+        COMMIT=$(git rev-parse --short=7 HEAD)
+        echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+        echo "bootable/recovery: $COMMIT"
+
+    - name: Clone device tree
+      run: |
+        git clone --depth=1 "${{ env.DEVICE_TREE_URL }}" \
+          -b "${{ env.DEVICE_TREE_BRANCH }}" \
+          "${{ env.SRC_DIR }}/${{ env.DEVICE_PATH }}"
+
+    - name: Get device tree commit
+      id: devtree_commit
+      run: |
+        cd "${{ env.SRC_DIR }}/${{ env.DEVICE_PATH }}"
+        COMMIT=$(git rev-parse --short=7 HEAD)
+        echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+        echo "device tree: $COMMIT"
+
+    - name: Set swap space
+      timeout-minutes: 15
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 30
+
+    - name: Build recovery
+      timeout-minutes: 240
+      run: |
+        set -o pipefail
+        mkdir -p "$GITHUB_WORKSPACE/logs"
+        cd "${{ env.SRC_DIR }}"
+
+        set +e
+        source build/envsetup.sh
+        set -e
+
+        export ALLOW_MISSING_DEPENDENCIES=true
+
+        # Compiler cache (non-fatal: the build continues without it)
+        if command -v ccache >/dev/null 2>&1; then
+          export USE_CCACHE=1
+          export CCACHE_EXEC="$(command -v ccache)"
+
+          mkdir -p "$CCACHE_DIR"
+
+          if ccache -M "$CCACHE_MAXSIZE" && ccache -z; then
+            echo "Compiler cache enabled: $CCACHE_EXEC"
+          else
+            echo "::warning::ccache initialization failed; continuing without cache."
+            unset USE_CCACHE CCACHE_EXEC
+          fi
+        else
+          echo "::warning::ccache unavailable; continuing without cache."
+          unset USE_CCACHE CCACHE_EXEC
+        fi
+
+        lunch ${{ env.MAKEFILE_NAME }}
+
+        # full console output is also kept as an artifact (recovery-build-logs)
+        mka adbd ${{ env.BUILD_TARGET }}image -j$(nproc --all) 2>&1 | tee "$GITHUB_WORKSPACE/logs/mka.log"
+
+    - name: Show compiler cache statistics
+      if: always()
+      run: |
+        mkdir -p "$GITHUB_WORKSPACE/logs"
+        if command -v ccache >/dev/null 2>&1; then
+          echo "=== Compiler cache statistics ==="
+          ccache -s | tee "$GITHUB_WORKSPACE/logs/ccache-stats.txt"
+          echo "=== Compiler cache disk usage ==="
+          du -sh "$CCACHE_DIR" 2>/dev/null || true
+          {
+            echo "### Compiler cache"
+            echo '```'
+            cat "$GITHUB_WORKSPACE/logs/ccache-stats.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Save compiler cache
+      if: success() && steps.ccache_restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: ${{ env.MANIFEST_BRANCH }}-sky-ccache
+      continue-on-error: true
+
+    - name: Upload recovery build logs (always)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: recovery-build-logs
+        path: |
+          logs/
+          ${{ env.SRC_DIR }}/out/error.log
+          ${{ env.SRC_DIR }}/out/verbose.log.gz
+          ${{ env.SRC_DIR }}/out/soong.log
+          ${{ env.SRC_DIR }}/out/build.trace.gz
+          ${{ env.SRC_DIR }}/out/.ninja_log
+        if-no-files-found: ignore
+
+    # Non-fatal: confirms the debug strings actually made it into the built
+    # recovery (the jail launcher is compiled into it). A warning here means
+    # the patched file is not part of this product's build.
+    - name: Verify the flashable zip
+      run: |
+        set +e
+        D="${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}"
+        rc=0
+        shopt -s nullglob
+        for z in "$D"/AERA-R*.zip; do
+          echo "### $(basename "$z"): $(stat -c%s "$z") bytes"
+          if unzip -t "$z" > /tmp/zt.log 2>&1; then
+            echo "### zip integrity: OK"
+          else
+            echo "### zip integrity: CORRUPT"
+            tail -30 /tmp/zt.log
+            rc=1
+          fi
+          ( cd "$(dirname "$z")" && md5sum "$(basename "$z")" | tee "$(basename "$z").md5" )
+        done
+        [ $rc -eq 0 ] || { echo "Flashable zip failed unzip -t"; exit 1; }
+
+    - name: Check the output directory
+      run: ls -l "${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/"
+
+    - name: Upload recovery images as an artifact (in case the release step fails)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: recovery-images
+        path: |
+          ${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.img
+          ${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.zip
+          ${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.zip.md5
+        if-no-files-found: ignore
+
+    - name: Upload to release
+      uses: softprops/action-gh-release@v3
+      with:
+        files: |
+          ${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.img
+          ${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.zip
+          ${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.zip.md5
+        fail_on_unmatched_files: false
+        name: ${{ env.DEVICE_NAME }}-${{ env.DEVICE_TREE_BRANCH }}-${{ steps.devtree_commit.outputs.commit }}
+        tag_name: ${{ github.run_id }}
+        body: |
+          Manifest: ${{ env.MANIFEST_BRANCH }}
+          Device: ${{ env.DEVICE_NAME }}
+          Target: ${{ env.BUILD_TARGET }}
+          Lunch: ${{ env.MAKEFILE_NAME }}
+          Device tree branch: ${{ env.DEVICE_TREE_BRANCH }}
+          Device tree commit: [${{ steps.devtree_commit.outputs.commit }}](${{ env.DEVICE_TREE_WEB }}/tree/${{ steps.devtree_commit.outputs.commit }})
+          bootable/recovery commit: [${{ steps.recovery_commit.outputs.commit }}](https://github.com/AERA-Recovery/android_bootable_recovery/tree/${{ steps.recovery_commit.outputs.commit }})
+          NVT blank-on-boot fix: ${{ inputs.nvt_blank_fix }}
+          FPS timing log: ${{ inputs.fps_timing }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  summary:
+    if: ${{ always() }}
+    needs: [recovery]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Job results
+        run: |
+          {
+            echo "## AERA recovery build"
+            echo
+            echo "| job | result |"
+            echo "|---|---|"
+            echo "| recovery | ${{ needs.recovery.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
